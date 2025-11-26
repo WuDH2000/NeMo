@@ -142,18 +142,18 @@ class TurnTakingMetrics:
         
         # Compute latency metrics - CRITICAL: always include latency metrics for all datasets
         # to ensure consistent metric structure across all ranks in distributed training
-        for name in all_names:
-            if self.latencies[name]:
-                # Calculate mean latency and create tensor from Python float (like BLEU does)
-                latency_mean = sum(self.latencies[name]) / len(self.latencies[name])
-                corpus_metrics[f"turn_taking_latency_{name}"] = torch.tensor(latency_mean)
-            else:
-                # CRITICAL: Even if no successful latencies, return 0.0 to maintain structure consistency
-                corpus_metrics[f"turn_taking_latency_{name}"] = torch.tensor(0.0)
+        # for name in all_names:
+        #     if self.latencies[name]:
+        #         # Calculate mean latency and create tensor from Python float (like BLEU does)
+        #         latency_mean = sum(self.latencies[name]) / len(self.latencies[name])
+        #         corpus_metrics[f"turn_taking_latency_{name}"] = torch.tensor(latency_mean)
+        #     else:
+        #         # CRITICAL: Even if no successful latencies, return 0.0 to maintain structure consistency
+        #         corpus_metrics[f"turn_taking_latency_{name}"] = torch.tensor(0.0)
         
         # Clear stored values
         self.accuracies.clear()
-        self.latencies.clear()
+        # self.latencies.clear()
         
         return corpus_metrics
 

@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .perception import AudioPerceptionModule
-from .speech_generation import TransformerARSpeechDecoder, EOUDecoder, EOUDecoderFromWav
+from .speech_generation import TransformerARSpeechDecoder
 
 __all__ = [
     'AudioPerceptionModule',
     'TransformerARSpeechDecoder',
-    'EOUDecoder',
-    'EOUDecoderFromWav',
 ]

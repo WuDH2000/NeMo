@@ -47,134 +47,9 @@ def sequence_mask(lengths: Tensor, max_length: int | None = None) -> Tensor:
     return x.unsqueeze(0) < lengths.unsqueeze(1)
 
 
-from transformers import MimiConfig
-from transformers.models.mimi.modeling_mimi import MimiEncoder, MimiTransformerModel, MimiConv1d, MimiConvTranspose1d, MimiDecoder
 from nemo.core.classes.module import NeuralModule
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 import torch.nn.functional as F
-
-class EOUDecoderFromWav(NeuralModule):
-    """
-    Transformer Audio encoder.
-
-    Args:
-        output_dim: Dimension of encoder output.
-    """
-
-    def __init__(
-        self,
-        samples_per_frame: int,
-        audio_proj_size: int = 1024, 
-        output_dim: int = 32,
-        n_layers: int = 8,
-        d_model: int = 1024,
-        d_ffn: int = 4096,
-        is_causal: bool = True,
-        sliding_window_size: int = 12,
-        max_position_embeddings: int = 8000,
-        rope_theta: float = 10000.0,
-        attn_implementation: str = "eager"
-    ):
-        super().__init__()
-
-        self.is_causal = is_causal
-        self.samples_per_frame = samples_per_frame
-        self.audio_proj_size = audio_proj_size
-        self.output_dim = output_dim
-
-        self.config = MimiConfig()
-        self.config._attn_implementation = attn_implementation
-        self.config.max_position_embeddings = max_position_embeddings
-        self.config.rope_theta = rope_theta
-
-        self.config.use_causal_conv = is_causal
-        self.config.num_hidden_layers = n_layers
-        self.config.intermediate_size = d_ffn
-        self.config.hidden_size = d_model
-        self.config.sliding_window = sliding_window_size
-        self.layers = MimiTransformerModel(self.config)
-
-        self.inp_projection_no_bias = nn.Linear(samples_per_frame, audio_proj_size, bias=False)
-        self.inp_projection = nn.Linear(audio_proj_size, d_model)
-        self.out_projection = nn.Linear(d_model, output_dim)
-
-    def forward(self, audio, audio_len):
-        # make the audio size divible by self.samples_per_frame
-        audio, audio_len = self.pad_audio(audio, audio_len)
-
-        encoded_len = audio_len
-        B, T = audio.size()
-        audio = audio.reshape(B, -1, self.samples_per_frame) # B, T, F, where 7 is the number of samples per frame that controls the frame rate
-        with fp32_precision():
-            encoded_len = (audio_len / self.samples_per_frame).long()
-
-        if self.is_causal:
-            mask = get_mask_from_lengths(encoded_len)
-        else:
-            # mask none does not apply causal mask
-            mask = None
-
-        out = self.inp_projection_no_bias(audio)
-        out = self.inp_projection(out)
-
-        out = self.layers(out, attention_mask=mask)[0]
-        # out projection
-        encoded = self.out_projection(out)
-        return encoded, encoded_len
-    
-    def pad_audio(self, audio, audio_len):
-        """Zero pad the end of the audio so that we do not have a partial end frame.
-        The output will be zero-padded to have an integer number of frames of
-        length `self.samples_per_frame`.
-
-        Args:
-            audio: input time-domain signal
-            audio_len: valid length for each example in the batch
-
-        Returns:
-            Padded time-domain signal `padded_audio` and its length `padded_len`.
-        """
-        with fp32_precision():
-            padded_len = self.samples_per_frame * torch.ceil(audio_len / self.samples_per_frame).int()
-        max_len = padded_len.max().item()
-        num_padding = max_len - audio.shape[1]
-        padded_audio = F.pad(audio, (0, num_padding))
-        return padded_audio, padded_len
-
-
-class EOUDecoder(NeuralModule):
-    def __init__(self, input_dim, params: DictConfig):
-        super().__init__()
-        self.input_proj = nn.Linear(input_dim, params["d_model"])
-        self.decoder = transformer_2501.Transformer(**params)
-        self.final_proj = nn.Linear(params["d_model"], 2)
-
-    def forward(self, x: Tensor, x_mask: Tensor | None = None) -> Tensor:
-        x = self.input_proj(x)
-        x = self.decoder(
-            x=x,
-            x_mask=x_mask,
-        )['output']
-
-        x = self.final_proj(x)
-        return x
-
-class EOUDecoder(NeuralModule):
-    def __init__(self, input_dim, params: DictConfig):
-        super().__init__()
-        self.input_proj = nn.Linear(input_dim, params["d_model"])
-        self.decoder = transformer_2501.Transformer(**params)
-        self.final_proj = nn.Linear(params["d_model"], 2)
-
-    def forward(self, x: Tensor, x_mask: Tensor | None = None) -> Tensor:
-        x = self.input_proj(x)
-        x = self.decoder(
-            x=x,
-            x_mask=x_mask,
-        )['output']
-
-        x = self.final_proj(x)
-        return x
 
 
 class CharAwareSubwordEncoder(NeuralModule):
@@ -230,6 +105,184 @@ class CharAwareSubwordEncoder(NeuralModule):
         subword_emb[subword_mask.unsqueeze(-1).expand(-1, -1, mean_emb.size(-1))] = mean_emb.view(-1)
 
         return subword_emb
+
+
+class SemanticTokenPredictor(NeuralModule):
+    """
+    Sequential Semantic Token Predictor for Duplex S2S Model
+    
+    设计理念（参考FireRedTTS2的codebook0_head）：
+    1. 只预测单层semantic tokens (WhisperVQ, 12.5 FPS)
+    2. Sequential prediction: text_token先预测，然后用text_token帮助预测semantic_token
+    3. 输入: [llm_hidden, text_embed] -> 输出: semantic_logits
+    4. 不需要speaker_emb（semantic对所有speaker都一样）
+    5. 轻量级设计，避免冗余
+    """
+    
+    def __init__(
+        self,
+        llm_hidden_dim: int,
+        semantic_vocab_size: int = 16384,  # WhisperVQ vocabulary size
+        hidden_dim: int = 512,  # Internal hidden dimension
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        self.llm_hidden_dim = llm_hidden_dim
+        self.semantic_vocab_size = semantic_vocab_size
+        self.hidden_dim = hidden_dim
+        
+        # Fusion layer: 融合 [llm_hidden, text_embed]
+        # Input: (B, T, llm_hidden_dim * 2) -> Output: (B, T, hidden_dim)
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(llm_hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Prediction head: 预测semantic token
+        # Input: (B, T, hidden_dim) -> Output: (B, T, semantic_vocab_size)
+        self.semantic_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, semantic_vocab_size),
+        )
+    
+    def forward(
+        self,
+        llm_hidden: torch.Tensor,     # (B, T, llm_hidden_dim) - LLM的last_hidden_state
+        text_embeds: torch.Tensor,    # (B, T, llm_hidden_dim) - embed_tokens(text_tokens)
+        semantic_labels: torch.Tensor = None,  # (B, T) - Ground truth semantic tokens (training only)
+        loss_mask: torch.Tensor = None,        # (B, T) - Valid positions for loss
+    ):
+        """
+        Forward pass for semantic token prediction.
+        
+        Args:
+            llm_hidden: (B, T, D) LLM的last_hidden_state，包含context和语义信息
+            text_embeds: (B, T, D) 已预测的text token的embeddings
+            semantic_labels: (B, T) Ground truth semantic tokens (仅训练时)
+            loss_mask: (B, T) 有效位置的mask（True=有效，False=padding）
+        
+        Returns:
+            dict with:
+                - semantic_logits: (B, T, semantic_vocab_size)
+                - semantic_loss: scalar (if semantic_labels provided)
+        """
+        B, T, D = llm_hidden.shape
+        
+        # Step 1: Concatenate llm_hidden and text_embeds
+        # Shape: (B, T, 2*D)
+        fused_input = torch.cat([llm_hidden, text_embeds], dim=-1)
+        
+        # Step 2: Fusion
+        # Shape: (B, T, hidden_dim)
+        fused = self.fusion_layer(fused_input)
+        
+        # Step 3: Predict semantic tokens
+        # Shape: (B, T, semantic_vocab_size)
+        semantic_logits = self.semantic_head(fused)
+        
+        result = {"semantic_logits": semantic_logits}
+        
+        # Step 4: Calculate loss if training
+        if semantic_labels is not None:
+            if loss_mask is not None:
+                # 只在valid positions计算loss
+                # semantic_logits[loss_mask]: (N, semantic_vocab_size) where N = loss_mask.sum()
+                # semantic_labels[loss_mask]: (N,)
+                semantic_loss = F.cross_entropy(
+                    semantic_logits[loss_mask],
+                    semantic_labels[loss_mask],
+                    reduction='mean'
+                )
+            else:
+                # 所有位置都计算loss
+                # semantic_logits.reshape(-1, vocab): (B*T, semantic_vocab_size)
+                # semantic_labels.reshape(-1): (B*T,)
+                semantic_loss = F.cross_entropy(
+                    semantic_logits.reshape(-1, self.semantic_vocab_size),
+                    semantic_labels.reshape(-1),
+                    reduction='mean'
+                )
+            result["semantic_loss"] = semantic_loss
+        
+        return result
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        llm_hidden: torch.Tensor,     # (B, 1, llm_hidden_dim) - Single timestep
+        text_embed: torch.Tensor,     # (B, 1, llm_hidden_dim) - Single timestep text embedding
+        temperature: float = 0.9,
+        topk: int = 20,
+    ):
+        """
+        Generate semantic token for one timestep (inference).
+        
+        Args:
+            llm_hidden: (B, 1, D) 当前timestep的LLM hidden state
+            text_embed: (B, 1, D) 当前timestep已预测的text token的embedding
+            temperature: Sampling temperature
+            topk: Top-k sampling
+        
+        Returns:
+            semantic_token: (B,) 采样得到的semantic token
+        """
+        B = llm_hidden.size(0)
+        
+        # Concatenate and fuse
+        # fused_input: (B, 1, 2*D)
+        fused_input = torch.cat([llm_hidden, text_embed], dim=-1)
+        
+        # fused: (B, 1, hidden_dim)
+        fused = self.fusion_layer(fused_input)
+        
+        # semantic_logits: (B, 1, semantic_vocab_size)
+        semantic_logits = self.semantic_head(fused)
+        
+        # Remove time dimension: (B, semantic_vocab_size)
+        semantic_logits = semantic_logits.squeeze(1)
+        
+        # Sample with temperature and top-k
+        semantic_token = self._sample_topk(semantic_logits, topk, temperature)
+        
+        return semantic_token
+    
+    def _sample_topk(self, logits, k, temperature):
+        """
+        Top-k sampling with temperature.
+        
+        Args:
+            logits: (B, vocab_size)
+            k: top-k value
+            temperature: temperature for sampling
+        
+        Returns:
+            sampled_tokens: (B,)
+        """
+        # Apply temperature
+        logits = logits / temperature
+        
+        # Mask out low-probability tokens
+        # topk_values: (B, k), topk_indices: (B, k)
+        topk_values = torch.topk(logits, k, dim=-1)[0]
+        
+        # Get minimum value in top-k: (B, 1)
+        threshold = topk_values[:, -1:] 
+        
+        # Mask logits below threshold
+        indices_to_remove = logits < threshold
+        logits[indices_to_remove] = -float('Inf')
+        
+        # Softmax and sample
+        probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+        
+        return sampled_tokens
 
 
 class TransformerARSpeechDecoder(NeuralModule):
