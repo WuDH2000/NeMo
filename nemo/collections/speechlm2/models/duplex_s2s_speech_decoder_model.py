@@ -40,7 +40,7 @@ from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
-from nemo.collections.speechlm2.modules.speech_generation import SemanticTokenPredictor
+from nemo.collections.speechlm2.modules.speech_generation import SemanticTokenPredictor, TransformerSemanticPredictor
 from nemo.collections.speechlm2.modules.speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from nemo.collections.speechlm2.modules.speech_tokenizer.utils import extract_speech_token
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
@@ -221,16 +221,31 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         )
 
         # Semantic token predictor for predicting output semantic tokens
-        # 使用SemanticTokenPredictor替代TransformerARSpeechDecoder
-        # 设计理念：Sequential prediction (text先，semantic后)
-        self.semantic_predictor = SemanticTokenPredictor(
-            llm_hidden_dim=self.llm.config.hidden_size,
-            semantic_vocab_size=self._codebook_size,  # 16384 - WhisperVQ semantic vocabulary
-            hidden_dim=self.cfg.get("semantic_predictor_hidden_dim", 512),
-            dropout=self.cfg.get("semantic_predictor_dropout", 0.1),
-        )
+        # Supports two modes: MLP (lightweight) or Transformer (with temporal modeling)
+        # Design: Sequential prediction (text first, then semantic)
+        self._use_transformer_semantic = self.cfg.get("use_transformer_semantic_predictor", False)
+        
+        if self._use_transformer_semantic:
+            self.semantic_predictor = TransformerSemanticPredictor(
+                llm_hidden_dim=self.llm.config.hidden_size,
+                semantic_vocab_size=self._codebook_size,  # 16384 - WhisperVQ semantic vocabulary
+                d_model=self.cfg.get("semantic_predictor_d_model", 1024),
+                n_heads=self.cfg.get("semantic_predictor_n_heads", 8),
+                n_layers=self.cfg.get("semantic_predictor_n_layers", 4),
+                n_cond_layers=self.cfg.get("semantic_predictor_n_cond_layers", 2),
+                dim_feedforward=self.cfg.get("semantic_predictor_dim_feedforward", 2048),
+                dropout=self.cfg.get("semantic_predictor_dropout", 0.1),
+                max_seq_len=self.cfg.get("semantic_predictor_max_seq_len", 4096),
+            )
+        else:
+            self.semantic_predictor = SemanticTokenPredictor(
+                llm_hidden_dim=self.llm.config.hidden_size,
+                semantic_vocab_size=self._codebook_size,  # 16384 - WhisperVQ semantic vocabulary
+                hidden_dim=self.cfg.get("semantic_predictor_hidden_dim", 512),
+                dropout=self.cfg.get("semantic_predictor_dropout", 0.1),
+            )
 
-        # Cached control codes for audio decoding (保留用于可能的future use)
+        # Cached control codes for audio decoding (kept for potential future use)
         self.register_buffer(
             "_control_codes",
             torch.tensor([self.speech_bos_id, self.speech_eos_id, self.speech_delay_id], device=self.device),
@@ -319,8 +334,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self,
             input_embeds: Tensor,
             cache=None,
-            text_labels=None,  # 改名：用于sequential prediction
-            semantic_labels=None,  # 新增：semantic token labels
+            text_labels=None,  # Text token labels for sequential prediction
+            semantic_labels=None,  # Semantic token labels
             loss_mask=None,
     ) -> dict[str, Tensor]:
         """
@@ -358,7 +373,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         ans = {
             "text_logits": text_logits,
-            "llm_hidden": llm_hidden,  # 保存用于inference
+            "llm_hidden": llm_hidden,  # Save for inference
         }
 
         if cache is not None:
@@ -373,7 +388,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # ========== Step 2: Semantic Token Prediction ==========
         # Prepare text embeddings
         # Training: use ground truth text tokens (teacher forcing)
-        # Inference: 会在generate方法中单独处理
+        # Inference: handled separately in generate method
         if text_labels is not None:
             # text_labels: (B, T)
             text_embeds = self.embed_tokens(text_labels)  # (B, T, D)
@@ -404,22 +419,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def prepare_inputs(self, batch: dict):
         """
-        准备训练输入，处理text和semantic tokens的对齐。
+        Prepare training inputs, handling alignment of text and semantic tokens.
         
-        关键设计：
-        1. Text的自回归：input[t-1] -> predict text[t]
-        2. Semantic的sequential prediction：用text[t] -> predict semantic[t]
-        3. 所以semantic_labels和text_labels是对齐的（同一个timestep）
+        Key design:
+        1. Text autoregressive: input[t-1] -> predict text[t]
+        2. Semantic sequential prediction: use text[t] -> predict semantic[t]
+        3. Therefore semantic_labels and text_labels are aligned (same timestep)
         
-        Shape流程：
+        Shape flow:
         - source_encoded: (B, T_audio, D) - Audio perception features
         - target_tokens: (B, T_text) - Text tokens
-        - target_semantic: (B, T_semantic) - Semantic tokens (从target_audio提取)
-        - 对齐到相同长度min_len
-        - Shift操作：
+        - target_semantic: (B, T_semantic) - Semantic tokens (extracted from target_audio)
+        - Align to same length min_len
+        - Shift operation:
             text_inputs: target_tokens[:, :-1]  -> (B, T-1)
             text_labels: target_tokens[:, 1:]   -> (B, T-1)
-            semantic_labels: target_semantic[:, 1:]  -> (B, T-1) # 注意：和text_labels对齐！
+            semantic_labels: target_semantic[:, 1:]  -> (B, T-1)  # Note: aligned with text_labels!
         """
         source_encoded, source_encoded_lens, asr_emb = self.perception(
             input_signal=batch["source_audio"],
@@ -439,14 +454,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         target_semantic = torch.tensor(target_semantic, dtype=torch.long, device=self.device)  # (B, T_tgt_audio)
 
         # ========== Length Alignment ==========
-        # 对齐所有序列到相同长度（只需对齐source_encoded, target_semantic, target_tokens）
+      
         min_len = min(
             source_encoded.shape[1],      # T_perception
             target_semantic.shape[1],     # T_tgt_audio
             target_tokens.shape[1]        # T_text
         )
         
-        # 截断到min_len
+       
         source_encoded = source_encoded[:, :min_len]          # (B, min_len, D)
         target_semantic = target_semantic[:, :min_len]        # (B, min_len)
         target_tokens = target_tokens[:, :min_len]            # (B, min_len)
@@ -454,16 +469,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # ========== Apply Autoregressive Shift ==========
         # Text channel: input[t-1] -> predict text[t]
-        text_inputs = target_tokens[:, :-1]   # (B, T-1) - 用于LLM input
+        text_inputs = target_tokens[:, :-1]   # (B, T-1) - Used as LLM input
         text_labels = target_tokens[:, 1:]    # (B, T-1) - text prediction target
         
         # Semantic channel: text[t] -> predict semantic[t]
-        # 关键：semantic_labels和text_labels是对齐的（预测同一个timestep）
-        # 在forward中，我们用text_labels作为text_embeds的来源
+        # Key: semantic_labels and text_labels are aligned (predicting same timestep)
+        # In forward, we use text_labels as source for text_embeds
         semantic_labels = target_semantic[:, 1:]  # (B, T-1) - semantic prediction target
 
         # ========== Prepare Input Embeddings ==========
-        # 组合text_embeds和audio perception embeds
+        # Combine text_embeds and audio perception embeds
         text_embeds = self.embed_tokens(text_inputs)  # (B, T-1, D)
         audio_embeds = source_encoded[:, :-1]         # (B, T-1, D)
         
@@ -481,12 +496,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_embeds = text_embeds + audio_embeds * self.cfg.get("duplex_user_channel_weight", 1.0)
         
         # ========== Prepare Loss Mask ==========
-        # loss_mask: (B, T-1) - True表示有效位置，False表示padding
+        # loss_mask: (B, T-1) - True indicates valid positions, False indicates padding
         loss_mask = torch.ones_like(text_labels, device=self.device, dtype=torch.bool)  # (B, T-1)
 
         result = {
             "input_embeds": input_embeds,           # (B, T-1, D)
-            "input_lens": source_encoded_lens - 1,  # (B,) - 因为做了shift，所以-1
+            "input_lens": source_encoded_lens - 1,  # (B,) - Subtract 1 due to shift operation
             "output_lens": source_encoded_lens - 1,  # (B,)
             "text_labels": text_labels,             # (B, T-1)
             "semantic_labels": semantic_labels,     # (B, T-1)
@@ -499,10 +514,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         """
         Training step for duplex S2S model.
         
-        数据流：
+        Data flow:
         1. prepare_inputs: batch -> input_embeds, text_labels, semantic_labels, loss_mask
         2. forward: input_embeds -> text_logits, semantic_logits
-        3. Loss计算：text_loss + semantic_loss
+        3. Loss computation: text_loss + semantic_loss
         """
         # Set frozen modules to eval mode
         # Note: semantic_predictor is NOT included as it should be trainable
@@ -661,8 +676,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def validation_step(self, batch: dict, batch_idx: int):
         """
         Validation step: 
-        - 只在前几个batch使用flow matching生成语音样本给results_logger
-        - 不计算mos和asr_bleu
+        - Only use flow matching to generate audio samples for results_logger in first few batches
+        - Does not compute mos and asr_bleu
         """
 
         decode_audio = (batch_idx < 2) and self.cfg.get("pretrained_flow", None) is not None
@@ -933,11 +948,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
         gen_semantic = torch.empty(B, T, device=self.device, dtype=torch.long)
         
+        # For TransformerSemanticPredictor: collect llm_hidden history
+        # This is needed because in cached mode, ans["llm_hidden"] only contains current step
+        if self._use_transformer_semantic:
+            llm_hidden_history = torch.empty(B, T, self.llm.config.hidden_size, device=self.device, dtype=source_encoded.dtype)
+        
         # ========== Unified Autoregressive Loop (Sequential Prediction) ==========
-        # 设计理念：
-        # 1. 每个timestep先通过LLM预测text token
-        # 2. 再用[llm_hidden, text_embed]预测semantic token
-        # 3. 这样semantic依赖于同一timestep的text，实现sequential prediction
+        # Design:
+        # 1. Each timestep first predicts text token via LLM
+        # 2. Then use [llm_hidden, text_embed] to predict semantic token
+        # 3. This way semantic depends on same-timestep text (sequential prediction)
         
         for t in range(T):
             # ===== Step 1: Prepare Input Embeddings =====
@@ -977,7 +997,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if use_cache:
                 # Standard cached mode - pass only current step
                 cache_to_use = cache if t == 0 else ans["cache"]
-                ans = self(current_input_emb, cache=cache_to_use)  # 只预测text，不传semantic_labels
+                ans = self(current_input_emb, cache=cache_to_use)  # Only predict text, no semantic_labels
                 gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)  # (B,)
             else:
                 # No-cache mode for Nemotron - pass full history up to current step
@@ -1017,22 +1037,45 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
 
             # ===== Step 3: Sequential Semantic Prediction =====
-            # 关键：用刚预测出的text[t]来预测semantic[t]
-            # Get llm_hidden for current timestep
-            # ans["llm_hidden"]: (B, 1, D) or (B, t+1, D) depending on cache mode
-            current_llm_hidden = ans["llm_hidden"][:, -1:, :]  # (B, 1, D)
-            
+            # Key: Use the just-predicted text[t] to predict semantic[t]
             # Get text embedding for just-predicted text token
             current_text_token = gen_text[:, t]  # (B,)
             current_text_emb = self.embed_tokens(current_text_token).unsqueeze(1)  # (B, 1, D)
             
-            # Predict semantic token using semantic_predictor.generate
-            gen_semantic[:, t] = self.semantic_predictor.generate(
-                llm_hidden=current_llm_hidden,  # (B, 1, D)
-                text_embed=current_text_emb,    # (B, 1, D)
-                temperature=self.cfg.get("semantic_temperature", 0.9),
-                topk=self.cfg.get("semantic_topk", 20),
-            )  # (B,)
+            # Get current llm_hidden
+            current_llm_hidden = ans["llm_hidden"][:, -1:, :]  # (B, 1, D)
+            
+            if self._use_transformer_semantic:
+                # TransformerSemanticPredictor: needs full history for cross-attention
+                # Store current llm_hidden in history
+                llm_hidden_history[:, t:t+1, :] = current_llm_hidden
+                
+                # Get all generated text tokens up to and including current
+                all_text_tokens = gen_text[:, :t+1]  # (B, t+1)
+                full_text_embeds = self.embed_tokens(all_text_tokens)  # (B, t+1, D)
+                
+                # Get llm_hidden history up to current step
+                full_llm_hidden = llm_hidden_history[:, :t+1, :]  # (B, t+1, D)
+                
+                # Past semantic tokens (0 to t-1), None for first step
+                past_semantic = gen_semantic[:, :t] if t > 0 else None  # (B, t) or None
+                
+                # Generate next semantic token with transformer
+                gen_semantic[:, t] = self.semantic_predictor.generate(
+                    llm_hidden=full_llm_hidden,
+                    text_embed=full_text_embeds,
+                    temperature=self.cfg.get("semantic_temperature", 0.9),
+                    topk=self.cfg.get("semantic_topk", 20),
+                    past_semantic_tokens=past_semantic,
+                )  # (B,)
+            else:
+                # MLP SemanticTokenPredictor: frame-wise prediction
+                gen_semantic[:, t] = self.semantic_predictor.generate(
+                    llm_hidden=current_llm_hidden,  # (B, 1, D)
+                    text_embed=current_text_emb,    # (B, 1, D)
+                    temperature=self.cfg.get("semantic_temperature", 0.9),
+                    topk=self.cfg.get("semantic_topk", 20),
+                )  # (B,)
 
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:

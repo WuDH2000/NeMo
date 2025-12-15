@@ -109,14 +109,17 @@ class CharAwareSubwordEncoder(NeuralModule):
 
 class SemanticTokenPredictor(NeuralModule):
     """
-    Sequential Semantic Token Predictor for Duplex S2S Model
+    MLP-based Semantic Token Predictor (Legacy/Simple version)
     
-    设计理念（参考FireRedTTS2的codebook0_head）：
-    1. 只预测单层semantic tokens (WhisperVQ, 12.5 FPS)
-    2. Sequential prediction: text_token先预测，然后用text_token帮助预测semantic_token
-    3. 输入: [llm_hidden, text_embed] -> 输出: semantic_logits
-    4. 不需要speaker_emb（semantic对所有speaker都一样）
-    5. 轻量级设计，避免冗余
+    This is a lightweight MLP that predicts semantic tokens frame-by-frame
+    without considering temporal dependencies between semantic tokens.
+    
+    Design:
+    1. Single-layer semantic tokens (WhisperVQ, 12.5 FPS)
+    2. Sequential prediction: text_token first, then use text_token to predict semantic_token
+    3. Input: [llm_hidden, text_embed] -> Output: semantic_logits
+    4. No speaker_emb needed (semantic is speaker-independent)
+    5. Lightweight design
     """
     
     def __init__(
@@ -132,7 +135,7 @@ class SemanticTokenPredictor(NeuralModule):
         self.semantic_vocab_size = semantic_vocab_size
         self.hidden_dim = hidden_dim
         
-        # Fusion layer: 融合 [llm_hidden, text_embed]
+        # Fusion layer: fuse [llm_hidden, text_embed]
         # Input: (B, T, llm_hidden_dim * 2) -> Output: (B, T, hidden_dim)
         self.fusion_layer = nn.Sequential(
             nn.Linear(llm_hidden_dim * 2, hidden_dim),
@@ -141,7 +144,7 @@ class SemanticTokenPredictor(NeuralModule):
             nn.Dropout(dropout),
         )
         
-        # Prediction head: 预测semantic token
+        # Prediction head: predict semantic token
         # Input: (B, T, hidden_dim) -> Output: (B, T, semantic_vocab_size)
         self.semantic_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -153,7 +156,7 @@ class SemanticTokenPredictor(NeuralModule):
     
     def forward(
         self,
-        llm_hidden: torch.Tensor,     # (B, T, llm_hidden_dim) - LLM的last_hidden_state
+        llm_hidden: torch.Tensor,     # (B, T, llm_hidden_dim) - LLM's last_hidden_state
         text_embeds: torch.Tensor,    # (B, T, llm_hidden_dim) - embed_tokens(text_tokens)
         semantic_labels: torch.Tensor = None,  # (B, T) - Ground truth semantic tokens (training only)
         loss_mask: torch.Tensor = None,        # (B, T) - Valid positions for loss
@@ -162,10 +165,10 @@ class SemanticTokenPredictor(NeuralModule):
         Forward pass for semantic token prediction.
         
         Args:
-            llm_hidden: (B, T, D) LLM的last_hidden_state，包含context和语义信息
-            text_embeds: (B, T, D) 已预测的text token的embeddings
-            semantic_labels: (B, T) Ground truth semantic tokens (仅训练时)
-            loss_mask: (B, T) 有效位置的mask（True=有效，False=padding）
+            llm_hidden: (B, T, D) LLM's last_hidden_state containing context and semantic info
+            text_embeds: (B, T, D) Embeddings of predicted text tokens
+            semantic_labels: (B, T) Ground truth semantic tokens (training only)
+            loss_mask: (B, T) Valid positions mask (True=valid, False=padding)
         
         Returns:
             dict with:
@@ -191,18 +194,14 @@ class SemanticTokenPredictor(NeuralModule):
         # Step 4: Calculate loss if training
         if semantic_labels is not None:
             if loss_mask is not None:
-                # 只在valid positions计算loss
-                # semantic_logits[loss_mask]: (N, semantic_vocab_size) where N = loss_mask.sum()
-                # semantic_labels[loss_mask]: (N,)
+                # Only compute loss at valid positions
                 semantic_loss = F.cross_entropy(
                     semantic_logits[loss_mask],
                     semantic_labels[loss_mask],
                     reduction='mean'
                 )
             else:
-                # 所有位置都计算loss
-                # semantic_logits.reshape(-1, vocab): (B*T, semantic_vocab_size)
-                # semantic_labels.reshape(-1): (B*T,)
+                # Compute loss at all positions
                 semantic_loss = F.cross_entropy(
                     semantic_logits.reshape(-1, self.semantic_vocab_size),
                     semantic_labels.reshape(-1),
@@ -219,30 +218,27 @@ class SemanticTokenPredictor(NeuralModule):
         text_embed: torch.Tensor,     # (B, 1, llm_hidden_dim) - Single timestep text embedding
         temperature: float = 0.9,
         topk: int = 20,
+        past_semantic_tokens: torch.Tensor = None,  # Unused, for API compatibility
     ):
         """
         Generate semantic token for one timestep (inference).
         
         Args:
-            llm_hidden: (B, 1, D) 当前timestep的LLM hidden state
-            text_embed: (B, 1, D) 当前timestep已预测的text token的embedding
+            llm_hidden: (B, 1, D) Current timestep's LLM hidden state
+            text_embed: (B, 1, D) Current timestep's predicted text token embedding
             temperature: Sampling temperature
             topk: Top-k sampling
+            past_semantic_tokens: Unused, for API compatibility with TransformerSemanticPredictor
         
         Returns:
-            semantic_token: (B,) 采样得到的semantic token
+            semantic_token: (B,) Sampled semantic token
         """
         B = llm_hidden.size(0)
         
         # Concatenate and fuse
-        # fused_input: (B, 1, 2*D)
-        fused_input = torch.cat([llm_hidden, text_embed], dim=-1)
-        
-        # fused: (B, 1, hidden_dim)
-        fused = self.fusion_layer(fused_input)
-        
-        # semantic_logits: (B, 1, semantic_vocab_size)
-        semantic_logits = self.semantic_head(fused)
+        fused_input = torch.cat([llm_hidden, text_embed], dim=-1)  # (B, 1, 2*D)
+        fused = self.fusion_layer(fused_input)  # (B, 1, hidden_dim)
+        semantic_logits = self.semantic_head(fused)  # (B, 1, semantic_vocab_size)
         
         # Remove time dimension: (B, semantic_vocab_size)
         semantic_logits = semantic_logits.squeeze(1)
@@ -267,20 +263,363 @@ class SemanticTokenPredictor(NeuralModule):
         # Apply temperature
         logits = logits / temperature
         
-        # Mask out low-probability tokens
-        # topk_values: (B, k), topk_indices: (B, k)
+        # Get top-k values and threshold
         topk_values = torch.topk(logits, k, dim=-1)[0]
-        
-        # Get minimum value in top-k: (B, 1)
-        threshold = topk_values[:, -1:] 
+        threshold = topk_values[:, -1:]
         
         # Mask logits below threshold
         indices_to_remove = logits < threshold
         logits[indices_to_remove] = -float('Inf')
         
         # Softmax and sample
-        probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
-        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+        probs = F.softmax(logits, dim=-1)
+        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        
+        return sampled_tokens
+    
+    def reset_cache(self):
+        """No-op for MLP predictor, for API compatibility."""
+        pass
+
+
+class TransformerSemanticPredictor(NeuralModule):
+    """
+    Transformer-based Semantic Token Predictor with autoregressive modeling.
+    
+    Design principles:
+    1. Leverage semantic token history via causal self-attention
+    2. Use cross-attention to attend to condition (llm_hidden + text_embeds)
+    3. Support KV cache for efficient autoregressive inference
+    
+    Architecture:
+    - Condition Encoder: Fuses llm_hidden and text_embeds, optional self-attention
+    - Semantic Decoder: Causal Transformer decoder with cross-attention to condition
+    
+    Input:
+    - llm_hidden: (B, T, D_llm) - LLM's hidden states
+    - text_embeds: (B, T, D_llm) - Predicted text token embeddings
+    - semantic_tokens: (B, T) - Shifted semantic tokens (training) or history (inference)
+    
+    Output:
+    - semantic_logits: (B, T, semantic_vocab_size)
+    """
+    
+    def __init__(
+        self,
+        llm_hidden_dim: int,
+        semantic_vocab_size: int = 16384,
+        d_model: int = 1024,           # Transformer internal dimension
+        n_heads: int = 8,
+        n_layers: int = 4,             # Decoder layers
+        n_cond_layers: int = 2,        # Condition encoder layers
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = 4096,
+    ):
+        super().__init__()
+        
+        self.llm_hidden_dim = llm_hidden_dim
+        self.semantic_vocab_size = semantic_vocab_size
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.max_seq_len = max_seq_len
+        
+        # ============ Condition Encoder ============
+        # Fuse llm_hidden and text_embeds to create cross-attention memory
+        self.condition_proj = nn.Linear(llm_hidden_dim * 2, d_model)
+        self.condition_norm = nn.LayerNorm(d_model)
+        
+        # Optional: self-attention layers for condition enhancement
+        if n_cond_layers > 0:
+            cond_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,  # Pre-norm for stability
+            )
+            self.condition_encoder = nn.TransformerEncoder(cond_layer, num_layers=n_cond_layers)
+        else:
+            self.condition_encoder = None
+        
+        # ============ Semantic Token Embeddings ============
+        # +1 for BOS token
+        self.semantic_bos_id = semantic_vocab_size
+        self.semantic_embedding = nn.Embedding(semantic_vocab_size + 1, d_model)
+        
+        # Positional encoding
+        self.pos_encoding = nn.Embedding(max_seq_len, d_model)
+        
+        # ============ Transformer Decoder ============
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
+        
+        # ============ Output Head ============
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, semantic_vocab_size)
+        
+        # ============ Cache for Inference ============
+        self._use_cache = False
+        self._condition_cache = None
+        self._semantic_cache = None
+        self._cache_pos = 0
+        
+        # Pre-compute causal mask
+        self.register_buffer("causal_mask", None, persistent=False)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights similar to GPT-2."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Generate causal attention mask (True = masked position)."""
+        if self.causal_mask is None or self.causal_mask.size(0) < seq_len:
+            mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+                diagonal=1
+            )
+            self.causal_mask = mask
+        return self.causal_mask[:seq_len, :seq_len]
+    
+    def _prepare_condition(
+        self,
+        llm_hidden: torch.Tensor,      # (B, T, D_llm)
+        text_embeds: torch.Tensor,     # (B, T, D_llm)
+    ) -> torch.Tensor:
+        """
+        Prepare condition (memory for cross-attention).
+        
+        Returns:
+            condition: (B, T, d_model)
+        """
+        # Concatenate and project
+        fused = torch.cat([llm_hidden, text_embeds], dim=-1)  # (B, T, 2*D_llm)
+        condition = self.condition_proj(fused)  # (B, T, d_model)
+        condition = self.condition_norm(condition)
+        
+        # Optional: encode with self-attention
+        if self.condition_encoder is not None:
+            condition = self.condition_encoder(condition)
+        
+        return condition
+    
+    def _prepare_semantic_input(
+        self,
+        semantic_tokens: torch.Tensor,  # (B, T)
+        start_pos: int = 0,
+    ) -> torch.Tensor:
+        """
+        Prepare semantic decoder input.
+        
+        Args:
+            semantic_tokens: (B, T) - Shifted semantic tokens
+            start_pos: Starting position for positional encoding (for cached inference)
+        
+        Returns:
+            semantic_embeds: (B, T, d_model)
+        """
+        B, T = semantic_tokens.shape
+        device = semantic_tokens.device
+        
+        # Embed semantic tokens
+        semantic_embeds = self.semantic_embedding(semantic_tokens)  # (B, T, d_model)
+        
+        # Add positional encoding
+        positions = torch.arange(start_pos, start_pos + T, device=device).unsqueeze(0).expand(B, -1)
+        pos_embeds = self.pos_encoding(positions)  # (B, T, d_model)
+        
+        semantic_embeds = semantic_embeds + pos_embeds
+        
+        return semantic_embeds
+    
+    def forward(
+        self,
+        llm_hidden: torch.Tensor,              # (B, T, D_llm)
+        text_embeds: torch.Tensor,             # (B, T, D_llm)
+        semantic_labels: torch.Tensor = None,  # (B, T) - ground truth for loss
+        loss_mask: torch.Tensor = None,        # (B, T) - valid positions
+    ) -> dict:
+        """
+        Training forward pass with teacher forcing.
+        
+        Input/Target alignment:
+        - Input:  [BOS, s_0, s_1, ..., s_{T-2}]  (shifted right)
+        - Target: [s_0, s_1, s_2, ..., s_{T-1}]  (original labels)
+        
+        Args:
+            llm_hidden: (B, T, D_llm) LLM hidden states
+            text_embeds: (B, T, D_llm) Text token embeddings
+            semantic_labels: (B, T) Ground truth semantic tokens
+            loss_mask: (B, T) Valid positions mask
+        
+        Returns:
+            dict with semantic_logits and optionally semantic_loss
+        """
+        B, T, _ = llm_hidden.shape
+        device = llm_hidden.device
+        
+        # ========== Step 1: Prepare Condition (Cross-Attention Memory) ==========
+        condition = self._prepare_condition(llm_hidden, text_embeds)  # (B, T, d_model)
+        
+        # ========== Step 2: Prepare Semantic Input (Shifted) ==========
+        if semantic_labels is not None:
+            # Training: shift labels right, prepend BOS
+            bos_tokens = torch.full((B, 1), self.semantic_bos_id, device=device, dtype=torch.long)
+            shifted_semantic = torch.cat([bos_tokens, semantic_labels[:, :-1]], dim=1)  # (B, T)
+        else:
+            # No labels: use all BOS (not useful, but for API consistency)
+            shifted_semantic = torch.full((B, T), self.semantic_bos_id, device=device, dtype=torch.long)
+        
+        semantic_input = self._prepare_semantic_input(shifted_semantic)  # (B, T, d_model)
+        
+        # ========== Step 3: Transformer Decoder ==========
+        causal_mask = self._get_causal_mask(T, device)
+        
+        decoder_output = self.decoder(
+            tgt=semantic_input,           # (B, T, d_model) - semantic sequence
+            memory=condition,             # (B, T, d_model) - condition from llm+text
+            tgt_mask=causal_mask,         # Causal mask for autoregressive
+            tgt_is_causal=True,
+        )  # (B, T, d_model)
+        
+        # ========== Step 4: Output Projection ==========
+        decoder_output = self.output_norm(decoder_output)
+        semantic_logits = self.output_proj(decoder_output)  # (B, T, semantic_vocab_size)
+        
+        result = {"semantic_logits": semantic_logits}
+        
+        # ========== Step 5: Calculate Loss ==========
+        if semantic_labels is not None:
+            if loss_mask is not None:
+                loss = F.cross_entropy(
+                    semantic_logits[loss_mask],
+                    semantic_labels[loss_mask],
+                    reduction='mean'
+                )
+            else:
+                loss = F.cross_entropy(
+                    semantic_logits.reshape(-1, self.semantic_vocab_size),
+                    semantic_labels.reshape(-1),
+                    reduction='mean'
+                )
+            result["semantic_loss"] = loss
+        
+        return result
+    
+    def reset_cache(self):
+        """Reset KV cache for new sequence."""
+        self._use_cache = False
+        self._condition_cache = None
+        self._semantic_cache = None
+        self._cache_pos = 0
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        llm_hidden: torch.Tensor,          # (B, T_cond, D_llm) - Full or incremental
+        text_embed: torch.Tensor,          # (B, T_cond, D_llm) - Full or incremental
+        temperature: float = 0.9,
+        topk: int = 20,
+        past_semantic_tokens: torch.Tensor = None,  # (B, T_past) - Previously generated tokens
+    ) -> torch.Tensor:
+        """
+        Generate next semantic token autoregressively.
+        
+        This method supports two modes:
+        1. Full sequence mode: Pass full llm_hidden/text_embed with past_semantic_tokens
+        2. Incremental mode: Use reset_cache() then call generate() step by step
+        
+        Args:
+            llm_hidden: (B, T, D_llm) LLM hidden states (full or current step)
+            text_embed: (B, T, D_llm) Text embeddings (full or current step)
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            past_semantic_tokens: (B, T_past) Previously generated semantic tokens
+        
+        Returns:
+            next_token: (B,) Next semantic token
+        """
+        B = llm_hidden.size(0)
+        device = llm_hidden.device
+        
+        # Prepare full condition sequence
+        condition = self._prepare_condition(llm_hidden, text_embed)  # (B, T_cond, d_model)
+        
+        # Prepare semantic input: [BOS] + past_tokens
+        if past_semantic_tokens is None or past_semantic_tokens.size(1) == 0:
+            # First step: only BOS
+            semantic_input_ids = torch.full((B, 1), self.semantic_bos_id, device=device, dtype=torch.long)
+        else:
+            # Prepend BOS to past tokens
+            bos_tokens = torch.full((B, 1), self.semantic_bos_id, device=device, dtype=torch.long)
+            semantic_input_ids = torch.cat([bos_tokens, past_semantic_tokens], dim=1)  # (B, T_past+1)
+        
+        T_dec = semantic_input_ids.size(1)
+        semantic_input = self._prepare_semantic_input(semantic_input_ids)  # (B, T_dec, d_model)
+        
+        # Causal mask for decoder
+        causal_mask = self._get_causal_mask(T_dec, device)
+        
+        # Decode
+        decoder_output = self.decoder(
+            tgt=semantic_input,
+            memory=condition,
+            tgt_mask=causal_mask,
+            tgt_is_causal=True,
+        )  # (B, T_dec, d_model)
+        
+        # Get last position logits
+        last_hidden = self.output_norm(decoder_output[:, -1, :])  # (B, d_model)
+        logits = self.output_proj(last_hidden)  # (B, semantic_vocab_size)
+        
+        # Sample with temperature and top-k
+        next_token = self._sample_topk(logits, topk, temperature)
+        
+        return next_token
+    
+    def _sample_topk(self, logits: torch.Tensor, k: int, temperature: float) -> torch.Tensor:
+        """
+        Top-k sampling with temperature.
+        
+        Args:
+            logits: (B, vocab_size)
+            k: top-k value
+            temperature: temperature for sampling
+        
+        Returns:
+            sampled_tokens: (B,)
+        """
+        # Apply temperature
+        logits = logits / temperature
+        
+        # Get top-k values and threshold
+        topk_values = torch.topk(logits, k, dim=-1)[0]
+        threshold = topk_values[:, -1:]
+        
+        # Mask logits below threshold
+        logits = logits.clone()
+        logits[logits < threshold] = -float('Inf')
+        
+        # Softmax and sample
+        probs = F.softmax(logits, dim=-1)
+        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
         
         return sampled_tokens
 
