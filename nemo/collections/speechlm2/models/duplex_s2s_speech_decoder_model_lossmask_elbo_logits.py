@@ -1717,7 +1717,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         #     print('gen_text_v2_filtered', gen_text_v2_filtered)
         ans = {
             "text": gen_text_v2,
-            "tokens_text": gen_text * gen_cot_classification,
+            "tokens_text": gen_text,
             "tokens_semantic": gen_semantic,  # Always return semantic tokens
             "tokens_len": lengths,
             "source_audio": input_signal,
