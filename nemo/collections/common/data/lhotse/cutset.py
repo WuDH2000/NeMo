@@ -18,6 +18,7 @@ from functools import partial
 from itertools import repeat
 from pathlib import Path
 from typing import KeysView, Mapping, Sequence, Tuple, Union
+import inspect
 import io
 import random
 import numpy as np
@@ -47,6 +48,16 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     TextTurn,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
+
+# Optional support for slice_length in CutSet.from_shar depends on Lhotse version.
+# Detect availability to keep compatibility with older installs.
+_SLICE_LENGTH_SUPPORTED = "slice_length" in inspect.signature(CutSet.from_shar).parameters
+
+
+def _slice_length_kwargs(config):
+    if not _SLICE_LENGTH_SUPPORTED:
+        return {}
+    return {"slice_length": config.get("slice_length", None)}
 
 
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
@@ -423,7 +434,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                 **_resolve_shar_inputs(config.shar_path, metadata_only),
                 shuffle_shards=True,
                 seed=shard_seed,
-                slice_length=config.get("slice_length", None),
+                **_slice_length_kwargs(config),
             )
             if not metadata_only and not force_finite:
                 cuts = cuts.repeat()
@@ -443,7 +454,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                         **_resolve_shar_inputs(path, metadata_only),
                         shuffle_shards=True,
                         seed=shard_seed,
-                        slice_length=config.get("slice_length", None),
+                        **_slice_length_kwargs(config),
                     )
                     weight = len(cs)
                 else:
@@ -458,7 +469,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                         **_resolve_shar_inputs(path, metadata_only),
                         shuffle_shards=True,
                         seed=shard_seed,
-                        slice_length=config.get("slice_length", None),
+                        **_slice_length_kwargs(config),
                     )
                 logging.info(f"- {path=} {weight=}")
                 cutsets.append(cs)
@@ -483,7 +494,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                 fields=fields,
                 shuffle_shards=True,
                 seed=shard_seed,
-                slice_length=config.get("slice_length", None),
+                **_slice_length_kwargs(config),
             )
             if not metadata_only and not force_finite:
                 cuts = cuts.repeat()

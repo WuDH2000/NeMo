@@ -618,7 +618,7 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
 
 
 def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int,
-                  user_bos_id: int = None, eval_text_turn_taking: bool = False, sil_id: int = None) -> list[str]:
+                  user_bos_id: int = None, cotstart_id: int = None, cotend_id: int = None, eval_text_turn_taking: bool = False, sil_id: int = None) -> list[str]:
     """
     Convert token IDs to text strings, filtering out special tokens.
 
@@ -644,6 +644,11 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
         # Filter out agent bos/eos
         token_ids = token_ids[token_ids != tokenizer.bos]
         token_ids = token_ids[token_ids != tokenizer.eos]
+        # Filter out cot start/end if provided
+        if cotstart_id is not None:
+            token_ids = token_ids[token_ids != cotstart_id]
+        if cotend_id is not None:
+            token_ids = token_ids[token_ids != cotend_id]
         # Filter out user bos if provided
         if user_bos_id is not None:
             token_ids = token_ids[token_ids != user_bos_id]

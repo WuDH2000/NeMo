@@ -1,0 +1,219 @@
+model:
+  pretrained_llm: Qwen/Qwen2.5-7B
+  pretrained_audio_codec: /lustre/fsw/portfolios/llmservice/users/cchen1/code/duplex_s2s/Low_Frame-rate_Speech_Codec++_without_speaker_encoder.nemo
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/kdhawan/models/cache-aware/oci-N-8_G-8_cacheaware-600M_granary-gsc_PC_multilookahead.nemo
+  scoring_asr: stt_en_fastconformer_transducer_large
+
+  freeze_params:
+    - "^audio_codec\\..+$"  # Keep audio codec frozen as it only provides supervision for training.
+  prevent_freeze_params: []
+
+  pretrained_weights: true
+  text_loss_weight: 1
+
+  audio_loss_weight: 0.2
+
+  # Semantic Predictor Configuration
+  # Set to true to use Transformer (with temporal modeling), false for MLP (lightweight)
+  use_transformer_semantic_predictor: true
+  
+  # Transformer Semantic Predictor parameters (used when use_transformer_semantic_predictor=true)
+  semantic_predictor_d_model: 1024
+  semantic_predictor_n_heads: 8
+  semantic_predictor_n_layers: 4
+  semantic_predictor_n_cond_layers: 2
+  semantic_predictor_dim_feedforward: 2048
+  semantic_predictor_max_seq_len: 4096
+  
+  # MLP Semantic Predictor parameters (used when use_transformer_semantic_predictor=false)
+  semantic_predictor_hidden_dim: 512
+  
+  # Shared parameters
+  semantic_predictor_dropout: 0.1
+  semantic_temperature: 0.9
+  semantic_topk: 20
+  pretrained_flow: /lustre/fsw/portfolios/llmservice/users/cchen1/code/s2s_oct/flow_decoder
+  text_to_text_loss_weight: 0.2   # audio data loss weight is: 1 - this value
+
+  duplex_user_channel_weight: 1.0
+  text_embedding_weight: 1.0
+  audio_save_path: ${exp_manager.explicit_log_dir}/pred_audios
+
+  use_gated_fusion: false
+  noise_prob: 0.0
+  noise_file_path: '/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/dns5/dns5_demand_noise/'
+
+  mask_sequence_loss: false  # set the mask based on the target_token_lens to disconsider sequence padding in loss
+  token_loss_weight:
+    bos: 10.0
+    eos: 5.0
+    pad: 1.0
+    text: 1.0
+  use_chunked_audio_loss: true
+  perception:
+     target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+
+     preprocessor:
+       normalize: 'NA'
+
+     encoder:
+       self_attention_model:
+       att_context_size: [70,0]
+       conv_context_size: causal
+       conv_norm_type: layer_norm
+
+     modality_adapter:
+       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+       d_model: 1024
+
+     spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2 # set to zero to disable it
+      time_masks: 20 # set to zero to disable it
+      freq_width: 27
+      time_width: 5
+      
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 3e-4 #3e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0
+    foreach: true # set to false if having issues with tensor-parallelism
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 2500 #2500
+    min_lr: 5e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: False # logger provided by exp_manager
+  enable_checkpointing: False
+  use_distributed_sampler: False
+  max_steps: 100000
+  val_check_interval: 2000
+  limit_train_batches: ${trainer.val_check_interval}  # an "epoch"
+  limit_val_batches: 2
+  log_every_n_steps: 10
+  num_sanity_val_steps: 0
+  gradient_clip_val: 1.0
+#  accumulate_grad_batches: 2
+  strategy:
+    _target_: lightning.pytorch.strategies.ModelParallelStrategy
+    tensor_parallel_size: 1
+    data_parallel_size: 8
+#    _target_: lightning.pytorch.strategies.DDPStrategy
+#    gradient_as_bucket_view: true
+#    find_unused_parameters: true
+
+data:
+  frame_length: 0.08
+  source_sample_rate: 16000
+  target_sample_rate: 16000
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+  text_max_tokens: 2048
+  aug_by_swap_role: False
+
+  train_ds:
+    seed: 42
+    shard_seed: "randomized"
+    num_workers: 1
+    shuffle: true
+    multi_config: true
+    sampler_fusion: randomized_round_robin # zip
+    sampler_weights:
+      interleave_s2s: 0.95
+      single_turn: 0.05
+      text_extract_knowledge: 0.05
+      
+    interleave_s2s:
+      input_cfg: /lustre/fsw/portfolios/llmservice/users/cchen1/code/s2s_pretrain/conf/data/duplex_pretrain_data.yaml
+      sample_rate: ${data.target_sample_rate}
+      pin_memory: false
+      batch_duration: null
+      batch_size: 1
+      max_duration: 240
+      num_buckets: 10
+      bucket_duration_bins: [72.84898,95.80626,112.16,125.99995,138.70653,151.24531,164.48063,180.48213,201.65873]
+      use_bucketing: true
+      bucket_buffer_size: 1000
+
+    single_turn:
+      input_cfg: /lustre/fsw/portfolios/llmservice/users/cchen1/code/s2s_pretrain/conf/data/all_singleQA.yaml
+      sample_rate: ${data.target_sample_rate}
+      pin_memory: false
+      batch_duration: 160
+      max_duration: 30
+      num_buckets: 10
+      bucket_duration_bins: [8.58626,9.46866,10.07238,10.62966,11.18689,11.74417,12.34789,13.09098,14.25197]
+      use_bucketing: true
+      bucket_buffer_size: 1000
+
+    text_extract_knowledge:
+      input_cfg: /lustre/fsw/portfolios/llmservice/users/cchen1/code/s2s_pretrain/conf/data/extract_knowledge.yaml
+      use_multimodal_sampling: true
+      cut_text_into_windows_tokens: 2048
+      prompt_format: plain
+      batch_size: 4
+      token_equivalent_duration: 0.08
+      use_bucketing: false
+      num_buckets: 30
+      num_cuts_for_bins_estimate: 10000
+      bucket_buffer_size: 1000
+
+
+  validation_ds:
+    datasets:
+#      singleQA:
+#        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/pretrain_s2s_data/valid_set_QA
+      llama-qa:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/eval_qa/llama_qa
+      web-qa:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/eval_qa/web_questions
+      mmsu:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/eval_qa/voicebench/mmsu
+      openbookqa:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/eval_qa/voicebench/openbookqa
+        
+    sample_rate: ${data.target_sample_rate}
+    batch_size: 8
+    seed: 42
+    shard_seed: "randomized"
+    num_workers: 1
+    max_duration: 200
+
+exp_manager:
+   exp_dir: null
+   explicit_log_dir: ???
+   name: ???
+   create_tensorboard_logger: false
+   create_checkpoint_callback: true
+   use_datetime_version: true
+   max_time_per_run: 00:03:50:00
+
+   resume_from_checkpoint: null # The path to a checkpoint file to continue the training, restores the whole state including the epoch, step, LR schedulers, apex, etc.
+   # you need to set these two to True to continue the training
+   resume_if_exists: true
+   resume_ignore_no_checkpoint: true
+
+   # You may use this section to create a W&B logger
+   create_wandb_logger: true
+   wandb_logger_kwargs:
+     name: ???
+     project: duplex_s2s_pretrain_cc
+     resume: true
+
+   checkpoint_callback_params:
+     filename: "{step}"
+     monitor: val_llama-qa_acc
+     mode: max
+     every_n_train_steps: null
+     every_n_epochs: 1
+     save_top_k: 2
+     always_save_nemo: false
+     save_nemo_on_train_end: false  # disable this to avoid error: 'DuplexS2SSpeechDecoderModel' object has no attribute 'save_to'
