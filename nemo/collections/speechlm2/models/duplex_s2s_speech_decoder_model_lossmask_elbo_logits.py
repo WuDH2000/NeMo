@@ -41,7 +41,7 @@ import torch.distributed.checkpoint as dcp
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
-from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
+from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str, tokens_to_str_extract
 from nemo.collections.speechlm2.modules.speech_generation import SemanticTokenPredictor, TransformerSemanticPredictor
 from nemo.collections.speechlm2.modules.speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from nemo.collections.speechlm2.modules.speech_tokenizer.utils import extract_speech_token
@@ -1698,14 +1698,26 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         #         get_res_str = strip_special_tokens_from_string(self.tokenizer, get_res_str)
         #     gen_cot_strs.append(get_cot_str)
         #     gen_res_strs.append(get_res_str)
-
-        ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id,
+        gen_text_v2 = tokens_to_str_extract(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id,
                                   user_bos_id=self.text_bos_id, 
                                   cotstart_id=self.cotstart_id,
                                   cotend_id=self.cotend_id,
-                                  eval_text_turn_taking=True),
-            "tokens_text": gen_text,
+                                  eval_text_turn_taking=True)
+        # if self.global_rank == 0:
+        #     print('gen_text_v2', gen_text_v2)
+        # gen_text_ori = tokens_to_str_ori(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens = False)
+        # if self.global_rank == 0:
+        #     print('gen_text_ori', gen_text_ori)
+        # gen_text_v2_filtered = tokens_to_str_extract(gen_text * gen_cot_classification, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id,
+        #                           user_bos_id=self.text_bos_id, 
+        #                           cotstart_id=self.cotstart_id,
+        #                           cotend_id=self.cotend_id,
+        #                           eval_text_turn_taking=True)
+        # if self.global_rank == 0:
+        #     print('gen_text_v2_filtered', gen_text_v2_filtered)
+        ans = {
+            "text": gen_text_v2,
+            "tokens_text": gen_text * gen_cot_classification,
             "tokens_semantic": gen_semantic,  # Always return semantic tokens
             "tokens_len": lengths,
             "source_audio": input_signal,
@@ -1987,3 +1999,11 @@ def strip_special_tokens_from_string(tokenizer, text: str) -> str:
     pattern = re.compile("|".join(re.escape(s) for s in specials))
     # 去掉多余空白
     return re.sub(r"\s+", " ", pattern.sub("", text)).strip()
+
+def tokens_to_str_ori(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int, remove_special_tokens = True) -> list[str]:
+    ans = []
+    for hyp_ids, hyp_len in zip(tokens.cpu(), lengths.cpu()):
+        hyp_ids = hyp_ids[:hyp_len]
+        hyp_ids = hyp_ids[hyp_ids != pad_id]
+        ans.append(tokenizer.ids_to_text(hyp_ids, remove_special_tokens))
+    return ans

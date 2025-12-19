@@ -697,3 +697,87 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
             hyp_ids = filter_special_tokens(hyp_ids)
             ans.append(tokenizer.ids_to_text(hyp_ids))
     return ans
+
+def tokens_to_str_extract(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int,
+                  user_bos_id: int = None, cotstart_id: int = None, cotend_id: int = None, eval_text_turn_taking: bool = False, sil_id: int = None) -> list[str]:
+    """
+    Convert token IDs to text strings, filtering out special tokens.
+
+    Args:
+        tokens: Token IDs tensor (B, T)
+        lengths: Length of each sequence (B,)
+        tokenizer: Tokenizer for decoding
+        pad_id: Pad token ID to filter out
+        user_bos_id: User BOS token ID to filter out (optional)
+        eval_text_turn_taking: If True, insert timestamps at bos/eos positions
+        sil_id: Silence token ID to filter out (optional)
+
+    Returns:
+        List of decoded text strings
+    """
+    ans = []
+
+    # Helper function to filter special tokens from token IDs
+    # This filtering is applied regardless of eval_text_turn_taking mode
+    def filter_special_tokens(token_ids):
+        # Filter out pad
+        token_ids = token_ids[token_ids != pad_id]
+        # Filter out agent bos/eos
+        token_ids = token_ids[token_ids != tokenizer.bos]
+        token_ids = token_ids[token_ids != tokenizer.eos]
+        # Filter out cot start/end if provided
+        if cotstart_id is not None:
+            token_ids = token_ids[token_ids != cotstart_id]
+        if cotend_id is not None:
+            token_ids = token_ids[token_ids != cotend_id]
+        # Filter out user bos if provided
+        if user_bos_id is not None:
+            token_ids = token_ids[token_ids != user_bos_id]
+        # Filter out sil if provided
+        if sil_id is not None:
+            token_ids = token_ids[token_ids != sil_id]
+        return token_ids
+
+    for _, hyp_ids, hyp_len in zip(tokens.cpu(), tokens.cpu(), lengths.cpu()):
+        if eval_text_turn_taking:
+            # Insert timestamps to the text
+            hyp_ids_list = hyp_ids.tolist()
+            agent_bos_positions = (hyp_ids == tokenizer.bos).nonzero(as_tuple=True)[0].tolist()
+            agent_eos_positions = (hyp_ids == tokenizer.eos).nonzero(as_tuple=True)[0].tolist()
+
+            # Combine and sort all positions with their types
+            all_positions = []
+            for pos in agent_bos_positions:
+                all_positions.append((pos, 'bos'))
+            for pos in agent_eos_positions:
+                all_positions.append((pos, 'eos'))
+
+            # Sort by position
+            all_positions.sort(key=lambda x: x[0])
+
+            start_idx = 0
+            out_str = []
+            for pos, pos_type in all_positions:
+                text_ids = hyp_ids[start_idx:pos]
+                # Filter out special tokens before converting to text
+                text_ids = filter_special_tokens(text_ids)
+                if start_idx > 0 and hyp_ids[start_idx] == tokenizer.bos and pos_type == 'eos':
+                    out_str.append(tokenizer.ids_to_text(text_ids))
+                start_idx = pos
+                timestamp = round(float(pos) * 0.08, 3)
+                
+                if pos_type == 'bos':
+                    out_str.append(f"<|{timestamp}|>")
+                else:  # eos
+                    out_str.append(f"<${timestamp}$>")
+            # Filter the remaining tokens after the last position
+            remaining_ids = filter_special_tokens(hyp_ids[start_idx:])
+            if start_idx > 0 and hyp_ids[start_idx] == tokenizer.bos:
+                out_str.append(tokenizer.ids_to_text(remaining_ids))
+            ans.append(" ".join(out_str))
+        else:
+            # For non-turn-taking mode: filter out ALL special tokens, return only pure text
+            hyp_ids = hyp_ids[:hyp_len]
+            hyp_ids = filter_special_tokens(hyp_ids)
+            ans.append(tokenizer.ids_to_text(hyp_ids))
+    return ans
