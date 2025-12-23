@@ -129,6 +129,8 @@ def freeze_and_subset(
         if not discard:
             yield param
             trainable += param.numel()
+            # if ("non_causal_encoder" in name) or trainable < 50:
+            #     logging.info(f"[OPT PARAM] {name} requires_grad={param.requires_grad}")
         else:
             nontrainable += param.numel()
     total = trainable + nontrainable

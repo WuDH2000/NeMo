@@ -370,7 +370,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             print('init_from_model_from_fsdp_ckpt', self.cfg.get("pretrained_fsdp_s2s_model"))
 
         # Add binary classification head for COT/response classification (output dim=1 for sigmoid)
-        self.cot_classification_head = torch.nn.Linear(self.llm.config.hidden_size, 1)
+        # self.cot_classification_head = torch.nn.Linear(self.llm.config.hidden_size, 1)
+        self.cot_classification_head = torch.nn.Sequential(
+            torch.nn.Linear(self.llm.config.hidden_size, 2 * self.llm.config.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(2 * self.llm.config.hidden_size, self.llm.config.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.llm.config.hidden_size, 1),
+        )
 
         # Add non-causal TransformerEncoder for ELBO approach
         self.non_causal_encoder_type = self.cfg.get("non_causal_encoder_type", None)
@@ -391,56 +398,62 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.non_causal_encoder = TransformerEncoder(encoder_layer, num_layers=self.cfg.get("non_causal_encoder_num_layers"))
         
         elif self.non_causal_encoder_type.lower() == 'bert':
-            from transformers import BertModel
             # Using bert-large-uncased architecture. 
             # Note: inputs_embeds is supported by BertModel.forward
-            self.non_causal_encoder = BertModel.from_pretrained("bert-large-uncased")
-            bert_dim = self.non_causal_encoder.config.hidden_size # 1024 for large
+            # self.non_causal_encoder = BertModel.from_pretrained("bert-large-uncased")
+            # bert_dim = self.non_causal_encoder.config.hidden_size # 1024 for large
             
-            # Extend BERT position embeddings to handle sequences > 512
-            # We extend to a safe margin (e.g. 4096) via interpolation
-            current_max_pos = self.non_causal_encoder.config.max_position_embeddings
-            new_max_pos = 4096
-            if current_max_pos < new_max_pos:
-                logging.info(f"Extending BERT position embeddings from {current_max_pos} to {new_max_pos}")
-                old_pos_emb = self.non_causal_encoder.embeddings.position_embeddings
-                new_pos_emb = nn.Embedding(new_max_pos, bert_dim)
+            # # Extend BERT position embeddings to handle sequences > 512
+            # # We extend to a safe margin (e.g. 4096) via interpolation
+            # current_max_pos = self.non_causal_encoder.config.max_position_embeddings
+            # new_max_pos = 4096
+            # if current_max_pos < new_max_pos:
+            #     logging.info(f"Extending BERT position embeddings from {current_max_pos} to {new_max_pos}")
+            #     old_pos_emb = self.non_causal_encoder.embeddings.position_embeddings
+            #     new_pos_emb = nn.Embedding(new_max_pos, bert_dim)
                 
-                # Interpolate existing weights to new length
-                with torch.no_grad():
-                    old_weights = old_pos_emb.weight.data.unsqueeze(0).transpose(1, 2) # (1, H, L)
-                    new_weights = torch.nn.functional.interpolate(old_weights, size=new_max_pos, mode='linear', align_corners=False)
-                    new_pos_emb.weight.data.copy_(new_weights.transpose(1, 2).squeeze(0))
+            #     # Interpolate existing weights to new length
+            #     with torch.no_grad():
+            #         old_weights = old_pos_emb.weight.data.unsqueeze(0).transpose(1, 2) # (1, H, L)
+            #         new_weights = torch.nn.functional.interpolate(old_weights, size=new_max_pos, mode='linear', align_corners=False)
+            #         new_pos_emb.weight.data.copy_(new_weights.transpose(1, 2).squeeze(0))
                 
-                # Replace in model
-                self.non_causal_encoder.embeddings.position_embeddings = new_pos_emb
-                self.non_causal_encoder.config.max_position_embeddings = new_max_pos
+            #     # Replace in model
+            #     self.non_causal_encoder.embeddings.position_embeddings = new_pos_emb
+            #     self.non_causal_encoder.config.max_position_embeddings = new_max_pos
                 
-                # Critical: Update BERT's internal buffers that depend on max_len
-                # 1. token_type_ids: Should be (1, max_len) for broadcasting
-                if hasattr(self.non_causal_encoder.embeddings, "token_type_ids"):
-                    new_token_type_ids = torch.zeros((1, new_max_pos), dtype=torch.long, device=self.non_causal_encoder.device)
-                    self.non_causal_encoder.embeddings.register_buffer("token_type_ids", new_token_type_ids, persistent=False)
+            #     # Critical: Update BERT's internal buffers that depend on max_len
+            #     # 1. token_type_ids: Should be (1, max_len) for broadcasting
+            #     if hasattr(self.non_causal_encoder.embeddings, "token_type_ids"):
+            #         new_token_type_ids = torch.zeros((1, new_max_pos), dtype=torch.long, device=self.non_causal_encoder.device)
+            #         self.non_causal_encoder.embeddings.register_buffer("token_type_ids", new_token_type_ids, persistent=False)
                 
-                # 2. position_ids: Should be (1, max_len)
-                if hasattr(self.non_causal_encoder.embeddings, "position_ids"):
-                    new_position_ids = torch.arange(new_max_pos, dtype=torch.long, device=self.non_causal_encoder.device).unsqueeze(0)
-                    self.non_causal_encoder.embeddings.register_buffer("position_ids", new_position_ids, persistent=False)
+            #     # 2. position_ids: Should be (1, max_len)
+            #     if hasattr(self.non_causal_encoder.embeddings, "position_ids"):
+            #         new_position_ids = torch.arange(new_max_pos, dtype=torch.long, device=self.non_causal_encoder.device).unsqueeze(0)
+            #         self.non_causal_encoder.embeddings.register_buffer("position_ids", new_position_ids, persistent=False)
+            from transformers import BertModel
+            bert_encoder = BertModel.from_pretrained("bert-large-uncased")
+            bert_dim = bert_encoder.config.hidden_size # 1024 for large
+            self.non_causal_encoder = bert_encoder.encoder
 
             if llm_hidden_size != bert_dim:
                 self.non_causal_proj_in = nn.Linear(llm_hidden_size, bert_dim)
                 self.non_causal_proj_out = nn.Linear(bert_dim, llm_hidden_size)
+            del bert_encoder
 
         elif self.non_causal_encoder_type.lower() == 'whisper':
             from transformers import WhisperModel
             # Using whisper-large-v3 encoder architecture
             # Use Wrapper to support inputs_embeds and FSDP
             whisper = WhisperModel.from_pretrained("openai/whisper-large-v3")
-            self.non_causal_encoder = WhisperEncoderWrapper(
-                whisper.encoder, 
-                gradient_checkpointing=self.cfg.get("gradient_checkpointing", False)
-            )
+            # self.non_causal_encoder = WhisperEncoderWrapper(
+            #     whisper.encoder, 
+            #     gradient_checkpointing=self.cfg.get("gradient_checkpointing", False)
+            # )
+            self.non_causal_encoder = whisper.encoder
             whisper_dim = whisper.config.d_model # 1280
+            del whisper
             
             if llm_hidden_size != whisper_dim:
                 self.non_causal_proj_in = nn.Linear(llm_hidden_size, whisper_dim)
@@ -698,11 +711,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 Z = self.non_causal_encoder(encoder_input)  # (B, T_full, H)
             elif self.non_causal_encoder_type == 'bert':
                 # BERT forward with inputs_embeds
-                outputs = self.non_causal_encoder(inputs_embeds=encoder_input)
+                outputs = self.non_causal_encoder(encoder_input)
                 Z = outputs.last_hidden_state
             elif self.non_causal_encoder_type == 'whisper':
                 # Whisper Encoder Wrapper supports inputs_embeds
+                D = encoder_input.shape[-1]
+                if T < 3000:
+                    # 如果长度不足 3000，补 0
+                    padding = torch.zeros((B, 3000 - T, D), 
+                                        dtype=encoder_input.dtype, 
+                                        device=encoder_input.device)
+                    encoder_input = torch.cat([encoder_input, padding], dim=1)
+                elif T > 3000:
+                    # 如果超过 3000 (虽然 ELBO 场景不常见)，强制截断
+                    encoder_input = encoder_input[:, :3000, :]
+                print(encoder_input.shape)
                 Z = self.non_causal_encoder(encoder_input)
+                Z = Z[:, :T, :]
             
             # Apply output projection if needed
             if self.non_causal_proj_out is not None:
@@ -1916,15 +1941,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.llm = fully_shard(self.llm, **fsdp_config)
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
+            self.whispervq = fully_shard(self.whispervq, **fsdp_config)
+            self.cot_classification_head = fully_shard(self.cot_classification_head, **fsdp_config)
             
             # Wrap semantic prediction module
             self.semantic_predictor = fully_shard(self.semantic_predictor, **fsdp_config)
 
             self.non_causal_encoder = fully_shard(self.non_causal_encoder, **fsdp_config)
-            # if self.non_causal_proj_in is not None:
-            #     self.non_causal_proj_in = fully_shard(self.non_causal_proj_in, **fsdp_config)
-            # if self.non_causal_proj_out is not None:
-            #     self.non_causal_proj_out = fully_shard(self.non_causal_proj_out, **fsdp_config)
+            if self.non_causal_proj_in is not None:
+                self.non_causal_proj_in = fully_shard(self.non_causal_proj_in, **fsdp_config)
+            if self.non_causal_proj_out is not None:
+                self.non_causal_proj_out = fully_shard(self.non_causal_proj_out, **fsdp_config)
                 
             # self.z_projection = fully_shard(self.z_projection, **fsdp_config)
             self.z_head = fully_shard(self.z_head, **fsdp_config)
