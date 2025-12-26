@@ -485,6 +485,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.z_head.train()
 
         self.if_force_cot_label = self.cfg.get("if_force_cot_label", False)
+        self.if_force_Z_embed = self.cfg.get("if_force_Z_embed", False)
         
 
     def init_from_model_from_ckpt(self, checkpoint_path):
@@ -713,21 +714,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 # BERT forward with inputs_embeds
                 outputs = self.non_causal_encoder(encoder_input)
                 Z = outputs.last_hidden_state
-            elif self.non_causal_encoder_type == 'whisper':
-                # Whisper Encoder Wrapper supports inputs_embeds
-                D = encoder_input.shape[-1]
-                if T < 3000:
-                    # 如果长度不足 3000，补 0
-                    padding = torch.zeros((B, 3000 - T, D), 
-                                        dtype=encoder_input.dtype, 
-                                        device=encoder_input.device)
-                    encoder_input = torch.cat([encoder_input, padding], dim=1)
-                elif T > 3000:
-                    # 如果超过 3000 (虽然 ELBO 场景不常见)，强制截断
-                    encoder_input = encoder_input[:, :3000, :]
-                print(encoder_input.shape)
-                Z = self.non_causal_encoder(encoder_input)
-                Z = Z[:, :T, :]
             
             # Apply output projection if needed
             if self.non_causal_proj_out is not None:
@@ -1208,15 +1194,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 continue  # some dataset is exhausted
 
             dataset_batch = dataset_batch["audio_data"]
-            loss_mask = self.prepare_inputs(dataset_batch)['loss_mask']
+            
+            get_input_dict = self.prepare_inputs(dataset_batch)
+            loss_mask = get_input_dict['loss_mask']
+            if self.if_force_Z_embed:
+                text_embed = get_input_dict['text_embed']
+            else:
+                text_embed = None
             results = self.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
                 decode_audio=decode_audio,
                 loss_mask = loss_mask,
-                if_force_cot_label = self.if_force_cot_label
+                text_embed = text_embed
             )
             print('if_force_cot_label', self.if_force_cot_label)
+            print('if_force_Z_embed', self.if_force_Z_embed)
 
       
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
@@ -1292,7 +1285,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_pad_len=self.cfg.prediction.max_new_seconds * self.cfg.prediction.input_sample_rate,
             force_bos_positions=force_bos_positions,
             loss_mask = loss_mask,
-            if_force_cot_label = self.if_force_cot_label
         )
         print('if_force_cot_label', self.if_force_cot_label)
         prediction["sample_id"] = batch["sample_id"]
@@ -1406,7 +1398,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_pad_len: int = 0,
             force_bos_positions=None,
             loss_mask = None,
-            if_force_cot_label = False
+            text_embed = None
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive text prediction.
@@ -1445,13 +1437,49 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         source_encoded, lengths, asr_emb = self.perception(
             input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
         )
-        B, T_local, H = source_encoded.shape
+        
+        E_z = None
+        if text_embed is not None and self.if_force_Z_embed and self.if_force_cot_label:
+            min_len = min(source_encoded.shape[1], text_embed.shape[1])
+            source_encoded = source_encoded[:, :min_len, :]
+            text_embed = text_embed[:, :min_len, :]
+            # Step 1: Generate Z using non-causal TransformerEncoder (full T frames)
+            encoder_input = source_encoded + text_embed
+            
+            # Apply input projection if needed
+            if self.non_causal_proj_in is not None:
+                encoder_input = self.non_causal_proj_in(encoder_input)
+
+            if 'trans' in self.non_causal_encoder_type.lower():
+                Z = self.non_causal_encoder(encoder_input)  # (B, T_full, H)
+            elif self.non_causal_encoder_type == 'bert':
+                # BERT forward with inputs_embeds
+                outputs = self.non_causal_encoder(encoder_input)
+                Z = outputs.last_hidden_state
+            
+            # Apply output projection if needed
+            if self.non_causal_proj_out is not None:
+                Z = self.non_causal_proj_out(Z)
+
+            # Z = self.z_projection(Z)  # (B, T_full, H)
+
+            # --- Modified Logic: Use Soft Embedding from Z ---
+            # Project Z to vocab logits (using independent z_head to match embedding dimension)
+            z_logits = self.z_head(Z) # (B, T_full, V_embed)
+            z_probs = torch.softmax(z_logits, dim=-1) # (B, T_full, V_embed)
+            
+            # Compute Soft Embedding: E_z = Probs @ EmbeddingMatrix
+            # Use self.embed_tokens directly as it was moved out of self.llm in __init__
+            embed_weight = self.embed_tokens.weight
+            
+            E_z = z_probs @ embed_weight # (B, T_full, H)
         # if self.global_rank == 0:
         #     print('loss_mask', loss_mask.shape)
         #     print('source_encoded', source_encoded.shape)
         #     print('T_local', T_local)
         #     print(self._use_fsdp)
         # Determine decoding length and pad if FSDP
+        B, T_local, H = source_encoded.shape
         if self._use_fsdp:
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
@@ -1467,6 +1495,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if loss_mask is not None and T > loss_mask.shape[1]:
                 pad_mask = torch.ones((loss_mask.shape[0], T - loss_mask.shape[1]), device=source_encoded.device).to(torch.long)
                 loss_mask = torch.cat([loss_mask, pad_mask], dim = 1)
+            if E_z is not None and T > E_z.shape[1]:
+                pad_E_z = E_z[:, :T_local, :][:, T_local - 1: T_local, :].repeat(1, T - T_local, 1)
+                E_z = torch.cat([E_z, pad_E_z], dim=1)
                 # if self.global_rank == 0:
                 #     print('pad_mask', pad_mask.shape)
         else:
@@ -1540,18 +1571,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 current_input_emb = last_text_emb.unsqueeze(1) + current_audio_emb * self.cfg.get("duplex_user_channel_weight", 1.0)
             else:
                 prev_cot_class = gen_cot_classification[:, t - 1]  # (B,)
-
                 # Get previous step's hidden state (from last forward pass)
                 # prev_hidden_state = ans["hidden_states"][-1][:, -1, :]  # (B, H) - last layer, last time step
                 # hidden_logits = self.llm.lm_head(prev_hidden_state) # (B, V_embed)
-                hidden_logits = ans["text_logits"][:, -1] # (B, V_embed)
-                hidden_probs = torch.softmax(hidden_logits, dim=-1) # (B, V_embed)
+                if E_z is None:
+                    hidden_logits = ans["text_logits"][:, -1] # (B, V_embed)
+                    hidden_probs = torch.softmax(hidden_logits, dim=-1) # (B, V_embed)
 
-                # Use self.embed_tokens directly
-                embed_weight = self.embed_tokens.weight
+                    # Use self.embed_tokens directly
+                    embed_weight = self.embed_tokens.weight
 
-                soft_hidden_emb = hidden_probs[:, :self.embed_tokens.weight.shape[0]]  @ embed_weight # (B, H)
-
+                    soft_hidden_emb = hidden_probs[:, :self.embed_tokens.weight.shape[0]]  @ embed_weight # (B, H)
+                else:
+                    soft_hidden_emb = E_z[:, t, :]
                 chosen_emb = torch.where(
                     prev_cot_class.unsqueeze(-1) == 1,  # (B, 1)
                     last_text_emb,                           # (B, H) - text token embedding
@@ -1618,7 +1650,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 #     print('if_force_cot_label', if_force_cot_label)
                 #     print('loss_mask', loss_mask.shape)
                 #     print('ans["cot_classification_logits"]', ans["cot_classification_logits"])
-            if loss_mask is not None and if_force_cot_label:
+            if loss_mask is not None and self.if_force_cot_label:
                 gen_cot_classification[:, t] = (loss_mask[:, t]).long()
                 gen_cot_logits[:, t] = ans["cot_classification_logits"][:, -1]
             else:
@@ -1728,11 +1760,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                                   cotstart_id=self.cotstart_id,
                                   cotend_id=self.cotend_id,
                                   eval_text_turn_taking=True)
-        # if self.global_rank == 0:
-        #     print('gen_text_v2', gen_text_v2)
-        # gen_text_ori = tokens_to_str_ori(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens = False)
-        # if self.global_rank == 0:
-        #     print('gen_text_ori', gen_text_ori)
+        if self.global_rank == 0:
+            print('gen_text_v2', gen_text_v2)
+        gen_text_ori = tokens_to_str_ori(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens = False)
+        if self.global_rank == 0:
+            print('gen_text_ori', gen_text_ori)
         # gen_text_v2_filtered = tokens_to_str_extract(gen_text * gen_cot_classification, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id,
         #                           user_bos_id=self.text_bos_id, 
         #                           cotstart_id=self.cotstart_id,
