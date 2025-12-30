@@ -556,6 +556,129 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                  raise e2
 
 
+    def init_from_fsdp_checkpoint_directory_unsharded_and_loaded(self, checkpoint_path, allow_partial_init: bool = True):
+        """
+        Load a torch distributed checkpoint (DCP) directory in *single-process* mode by unsharding
+        all distcp shards into a full (unsharded) state_dict, then calling load_state_dict().
+
+        This is useful when your checkpoint directory contains multiple shard files
+        (e.g. __0_0.distcp ... __7_0.distcp) but your inference script is not launched with torchrun.
+
+        Notes:
+        - This will materialize a full state_dict on CPU, which can require significant host RAM.
+        - If you are already running in distributed mode (world_size > 1), we fall back to the
+          original init_from_fsdp_checkpoint_directory() behavior.
+        - If allow_partial_init=True (default), missing/unmatched keys will keep their current model values
+          (via set_model_dict_for_partial_init). This can hide partial loads; use DEBUG_CKPT_LOAD=1 to inspect.
+        """
+        if checkpoint_path is None:
+            return
+
+        if not os.path.isdir(checkpoint_path):
+            logging.warning(f"FSDP path {checkpoint_path} is not a directory! Skipping load.")
+            return
+
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            logging.warning(
+                "init_from_fsdp_checkpoint_directory_unsharded_and_loaded() was called in distributed mode; "
+                "falling back to init_from_fsdp_checkpoint_directory()."
+            )
+            return self.init_from_fsdp_checkpoint_directory(checkpoint_path)
+
+        # First, try the most direct DCP load path: load into the module with the expected "state_dict" prefix.
+        # With no_dist=True, this should read and combine all shards in a single process.
+        try:
+            print(f"LOADER: Loading FSDP/DCP weights via direct mapping (single-process, no_dist=True): {checkpoint_path}")
+            state_dict_to_load = {"state_dict": self}
+            dcp.load(state_dict=state_dict_to_load, checkpoint_id=checkpoint_path, no_dist=True)
+            print("LOADER: Successfully loaded via direct DCP mapping (single-process).")
+            return
+        except Exception as e:
+            logging.warning(f"LOADER: Direct DCP mapping load failed, falling back to unshard+load_state_dict: {e}")
+
+        # Single-process unshard path using FileSystemReader + metadata.
+        from torch.distributed.checkpoint import FileSystemReader
+
+        print(f"LOADER: Unsharding and loading FSDP/DCP weights from directory (single-process): {checkpoint_path}")
+
+        fs_reader = FileSystemReader(checkpoint_path)
+        metadata = fs_reader.read_metadata()
+
+        full_state_dict = {
+            k: torch.empty(tp.size, dtype=tp.properties.dtype, device="cpu")
+            for k, tp in metadata.state_dict_metadata.items()
+            if type(tp).__name__ == "TensorStorageMetadata"
+        }
+
+        # Critical: in single-process inference, ensure we load *all* shards from a DCP directory.
+        dcp.load(full_state_dict, storage_reader=fs_reader, no_dist=True)
+
+        # Strip common Lightning/NeMo prefix "state_dict."
+        prefix = "state_dict."
+        if full_state_dict and all(k.startswith(prefix) for k in full_state_dict.keys()):
+            full_state_dict = {k[len(prefix) :]: v for k, v in full_state_dict.items()}
+        elif any(k.startswith(prefix) for k in full_state_dict.keys()):
+            # Mixed keys (defensive)
+            fixed = {}
+            for k, v in full_state_dict.items():
+                fixed[k[len(prefix) :]] = v if k.startswith(prefix) else v
+            full_state_dict = fixed
+
+        # Optional diagnostics: compare checkpoint keys vs model keys (helps catch silent partial loads).
+        if os.environ.get("DEBUG_CKPT_LOAD", "0") == "1":
+            model_sd = self.state_dict()
+            model_keys = set(model_sd.keys())
+            ckpt_keys = set(full_state_dict.keys())
+            missing = sorted(model_keys - ckpt_keys)
+            unexpected = sorted(ckpt_keys - model_keys)
+            shape_mismatch = []
+            for k in sorted(model_keys & ckpt_keys):
+                mv = model_sd.get(k)
+                cv = full_state_dict.get(k)
+                if hasattr(mv, "numel") and hasattr(cv, "numel") and mv.numel() != cv.numel():
+                    shape_mismatch.append(k)
+
+            logging.info(
+                f"LOADER(DEBUG): ckpt_tensors={len(ckpt_keys)} model_tensors={len(model_keys)} "
+                f"missing={len(missing)} unexpected={len(unexpected)} shape_mismatch={len(shape_mismatch)}"
+            )
+            if missing:
+                logging.info("LOADER(DEBUG): sample missing keys:\n" + "\n".join(missing[:50]))
+            if unexpected:
+                logging.info("LOADER(DEBUG): sample unexpected keys:\n" + "\n".join(unexpected[:50]))
+            if shape_mismatch:
+                logging.info("LOADER(DEBUG): sample shape_mismatch keys:\n" + "\n".join(shape_mismatch[:50]))
+
+        if allow_partial_init:
+            # partial initialization support (keeps current values for missing/unmatched keys)
+            full_state_dict = set_model_dict_for_partial_init(full_state_dict, self.state_dict())
+            self.load_state_dict(full_state_dict, strict=True)
+        else:
+            # strict load: will raise if there are missing/unexpected keys
+            self.load_state_dict(full_state_dict, strict=True)
+
+        # Optional quick sanity check for corrupted loads (NaN/Inf) on a small sample of parameters.
+        if os.environ.get("DEBUG_CKPT_SANITY", "0") == "1":
+            import random as _random
+
+            sd = self.state_dict()
+            keys = list(sd.keys())
+            _random.shuffle(keys)
+            sample = keys[:20]
+            bad = []
+            for k in sample:
+                v = sd[k]
+                if torch.is_tensor(v) and v.numel() > 0 and v.is_floating_point():
+                    if not torch.isfinite(v).all().item():
+                        bad.append(k)
+            if bad:
+                logging.error(f"LOADER(DEBUG_CKPT_SANITY): detected non-finite params (sample): {bad}")
+            else:
+                logging.info("LOADER(DEBUG_CKPT_SANITY): sample params are finite.")
+
+        print("LOADER: Successfully unsharded and loaded FSDP/DCP checkpoint in single-process mode.")
+
+
     @property
     def text_vocab_size(self):
         """Return the size of the text tokenizer."""
@@ -1707,7 +1830,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 loss_mask = loss_mask[:, :T_local]
 
         # gen_text_strs = tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens = False)
-        if self.global_rank == 0:
+        if self.global_rank == 0 and loss_mask is not None:
             # print(gen_text_strs[0])
             # print('gen_cot_classification', gen_cot_classification)
             # print('loss_mask', loss_mask)
@@ -1779,6 +1902,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "tokens_len": lengths,
             "source_audio": input_signal,
             "source_audio_len": input_signal_lens,
+            "output_text": gen_text_ori
         }
 
         # ========== Decode Semantic Tokens to Waveform ==========
