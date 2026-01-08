@@ -265,7 +265,7 @@ class SemanticTokenPredictor(NeuralModule):
         
         # Get top-k values and threshold
         topk_values = torch.topk(logits, k, dim=-1)[0]
-        threshold = topk_values[:, -1:]
+        threshold = topk_values[:, -1:] 
         
         # Mask logits below threshold
         indices_to_remove = logits < threshold

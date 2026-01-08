@@ -17,9 +17,11 @@ import torch
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
-from nemo.collections.speechlm2.data.s2s_dataset_lossmask_lat_elbo import DuplexS2SDataset
+# from nemo.collections.speechlm2.data.s2s_dataset_lossmask_lat_elbo import DuplexS2SDataset
+from nemo.collections.speechlm2.data.s2s_dataset import DuplexS2SDataset
 from nemo.collections.speechlm2 import DataModule
-from nemo.collections.speechlm2.models.duplex_s2s_speech_decoder_model_lossmask_elbo_logits import DuplexS2SSpeechDecoderModel
+# from nemo.collections.speechlm2.models.duplex_s2s_speech_decoder_model_lossmask_elbo_logits import DuplexS2SSpeechDecoderModel
+from nemo.collections.speechlm2.models.duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
