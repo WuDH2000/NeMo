@@ -61,516 +61,6 @@ from nemo.collections.speechlm2.parts.pretrained import (
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
-import librosa
-import sys
-# # 假设 FireRedTTS2 在此路径，确保能 import
-sys.path.append("./FireRedTTS2/")
-
-from FireRedTTS2.fireredtts2.codec.model import RedCodecInfer
-from FireRedTTS2.fireredtts2.llm.modules import FLAVORS
-from FireRedTTS2.fireredtts2.llm.llm import _prepare_transformer, _create_causal_mask, _index_causal_mask, sample_topk
-from nemo.collections.asr.models import EncDecSpeakerLabelModel
-
-class FireRedSpeechGenerator(nn.Module):
-    def __init__(self, cfg, tokenizer):
-        super().__init__()
-        self.cfg = cfg
-        self.tokenizer = tokenizer
-        
-        # FireRedTTS2 配置参数
-        self._codebook_size = self.cfg.get("audio_vocab_size", 4096) 
-        self._num_codebooks = self.cfg.get("audio_num_codebooks", 16)
-        
-        # 1. TTS Backbone & Decoder
-        backbone_flavor = self.cfg.get("backbone_flavor", "qwen-200m") # Default flavor
-        decoder_flavor = self.cfg.get("decoder_flavor", "qwen-200m")
-        
-        # Get model dtype from config (default bfloat16 for mixed precision training)
-        model_dtype_str = self.cfg.get("model_dtype", "bfloat16")
-        model_dtype = torch.bfloat16 if model_dtype_str == "bfloat16" else torch.float32
-        
-        self.tts_backbone, self.tts_backbone_dim = _prepare_transformer(FLAVORS[backbone_flavor]())
-        self.tts_decoder, self.tts_decoder_dim = _prepare_transformer(FLAVORS[decoder_flavor]())
-        
-        # Convert to correct dtype (torchtune defaults to float32)
-        self.tts_backbone = self.tts_backbone.to(model_dtype)
-        self.tts_decoder = self.tts_decoder.to(model_dtype)
-        
-        # 2. Speaker Encoder (TitaNet)
-        speaker_encoder_name = self.cfg.get("speaker_encoder_name", "titanet_large")
-        self.speaker_encoder = EncDecSpeakerLabelModel.from_pretrained(model_name=speaker_encoder_name).eval()
-        for p in self.speaker_encoder.parameters():
-            p.requires_grad = False # Freeze Speaker Encoder
-            
-        # Speaker embedding dim from config (default 192 for titanet_large)
-        spk_emb_dim = self.cfg.get("speaker_embedding_dim", 192)
-
-        # 3. Projections
-        # Input: LLM Hidden (D_llm) + Text Embed (D_llm) + Speaker Emb (D_spk)
-        # Note: We assume Text Embed has same dim as LLM Hidden (D_llm)
-        # If not, we might need adjustments. For Qwen, they are same.
-        
-        # We need to know D_llm. We can get it from first forward or pass it in. 
-        # But here we need to init projections.
-        # Let's assume D_llm is passed in cfg or we infer it?
-        # Standard approach: pass explicit dim or rely on lazy init (not ideal).
-        # We'll use a config param `llm_hidden_size`.
-        self.llm_hidden_size = self.cfg.get("llm_hidden_size", 3584) # Qwen2.5-7B default
-        
-        input_dim = self.llm_hidden_size * 2 + spk_emb_dim
-        self.tts_input_projection = nn.Linear(input_dim, self.tts_backbone_dim).to(model_dtype)
-        
-        # Backbone -> Decoder
-        self.backbone_to_decoder_projection = nn.Linear(self.tts_backbone_dim, self.tts_decoder_dim, bias=False).to(model_dtype)
-        
-        # 4. Heads & Embeddings
-        # C0 Prediction Head (Backbone Output -> Codebook 0)
-        self.codebook0_head = nn.Linear(self.tts_backbone_dim, self._codebook_size, bias=False).to(model_dtype)
-        
-        # C1~CN Decoder Audio Embeddings (Input to Decoder)
-        # Stores embeddings for [C0, C1, ..., CN-1]
-        self.decoder_audio_embeddings = nn.Embedding(
-            self._codebook_size * self._num_codebooks, self.tts_decoder_dim
-        ).to(model_dtype)
-        
-        # C1~CN Prediction Head (Decoder Output -> Codebooks 1~CN-1)
-        # Shared or separate? FireRed uses [num_codebooks-1, D, V] parameter
-        self.audio_head = nn.Parameter(
-            torch.empty(self._num_codebooks - 1, self.tts_decoder_dim, self._codebook_size, dtype=model_dtype)
-        )
-        
-        # Register Buffers for Masks (Lazy init or fixed max len)
-        # We'll use lazy init in forward/inference as needed or dynamic creation
-        self.register_buffer("backbone_causal_mask", _create_causal_mask(self.tts_backbone.max_seq_len, torch.device("cpu")))
-        self.register_buffer("decoder_causal_mask", _create_causal_mask(self._num_codebooks, torch.device("cpu")))
-        
-        # Register inference_speaker_embedding as buffer - its dtype will follow FSDP/mixed precision
-        spk_emb_dim = self.cfg.get("speaker_embedding_dim", 192)
-        self.register_buffer("inference_speaker_embedding", torch.randn(1, 1, spk_emb_dim))
-        
-        # Load weights if checkpoint is provided in config
-        if self.cfg.get("firered_checkpoint_path", None):
-            self.load_pretrained_weights(self.cfg.firered_checkpoint_path)
-
-    def load_pretrained_weights(self, checkpoint_path):
-        """Load pretrained FireRedTTS2 weights"""
-        if not os.path.exists(checkpoint_path):
-            logging.warning(f"FireRed checkpoint not found: {checkpoint_path}")
-            return
-            
-        logging.info(f"Loading FireRed weights from {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        
-        # Handle different checkpoint formats
-        if 'model' in ckpt:
-            state_dict = ckpt['model']
-        elif 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
-        else:
-            state_dict = ckpt
-            
-        # Key mapping: checkpoint uses 'backbone.' and 'decoder.', 
-        # but our model uses 'tts_backbone.' and 'tts_decoder.'
-        mapped_state_dict = {}
-        for k, v in state_dict.items():
-            new_key = k
-            # Map backbone -> tts_backbone
-            if k.startswith('backbone.'):
-                new_key = 'tts_backbone.' + k[len('backbone.'):]
-            # Map decoder -> tts_decoder  
-            elif k.startswith('decoder.'):
-                new_key = 'tts_decoder.' + k[len('decoder.'):]
-            # Map projection -> backbone_to_decoder_projection
-            elif k.startswith('projection.'):
-                new_key = 'backbone_to_decoder_projection.' + k[len('projection.'):]
-            # Map codebook0_head - truncate vocab dimension if needed
-            elif k.startswith('codebook0_head.'):
-                new_key = k
-                # Truncate from 2051 to actual codec codebook_size (2048)
-                if 'weight' in k and v.shape[0] > self._codebook_size:
-                    logging.info(f"Truncating {k} from {v.shape[0]} to {self._codebook_size}")
-                    v = v[:self._codebook_size, :]
-            # audio_head - truncate vocab dimension if needed
-            elif k == 'audio_head':
-                new_key = k
-                # audio_head shape: (num_codebooks-1, D_dec, vocab_size)
-                if v.shape[-1] > self._codebook_size:
-                    logging.info(f"Truncating {k} from {v.shape[-1]} to {self._codebook_size}")
-                    v = v[:, :, :self._codebook_size]
-            # Map audio_embeddings -> decoder_audio_embeddings (truncate each codebook's vocab)
-            elif k.startswith('audio_embeddings.'):
-                new_key = 'decoder_audio_embeddings.' + k[len('audio_embeddings.'):]
-                # audio_embeddings shape: (old_vocab_size * num_codebooks, D)
-                # Need to truncate each codebook's vocab from old_vocab_size to new_vocab_size
-                if 'weight' in k:
-                    old_total = v.shape[0]  # 2051 * 16 = 32816
-                    num_codebooks = self._num_codebooks
-                    old_vocab_size = old_total // num_codebooks  # 2051
-                    new_vocab_size = self._codebook_size  # 2048
-                    if old_vocab_size > new_vocab_size:
-                        logging.info(f"Truncating {k} vocab from {old_vocab_size} to {new_vocab_size} per codebook")
-                        # Reshape, truncate, reshape back
-                        v_reshaped = v.view(num_codebooks, old_vocab_size, -1)  # (16, 2051, D)
-                        v_truncated = v_reshaped[:, :new_vocab_size, :]  # (16, 2048, D)
-                        v = v_truncated.reshape(num_codebooks * new_vocab_size, -1)  # (32768, D)
-            # Skip keys we don't need (text_embeddings, text_head - we use LLM's)
-            elif k.startswith('text_embeddings.') or k.startswith('text_head.'):
-                continue  # Skip these keys
-            
-            mapped_state_dict[new_key] = v
-            
-        # Load with strict=False
-        missing, unexpected = self.load_state_dict(mapped_state_dict, strict=False)
-        
-        # Log results
-        if missing:
-            logging.info(f"FireRed Load - Missing keys ({len(missing)}): {missing[:10]}...")
-        if unexpected:
-            logging.info(f"FireRed Load - Unexpected keys ({len(unexpected)}): {unexpected[:10]}...")
-        logging.info(f"FireRed Load Result - Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-
-    def setup_speaker_encoder(self):
-        """Reload speaker encoder to bypass FSDP DTensor issues"""
-        speaker_encoder_name = self.cfg.get("speaker_encoder_name", "titanet_large")
-        with fp32_precision():
-            self.speaker_encoder = EncDecSpeakerLabelModel.from_pretrained(model_name=speaker_encoder_name)
-        self.speaker_encoder.eval()
-        self.speaker_encoder.freeze()
-        for p in self.speaker_encoder.parameters():
-            p.requires_grad = False
-    
-    def get_speaker_embedding(self, audio, audio_len, sr):
-        """Robust Speaker Embedding Extraction - matching original NeMo implementation"""
-        # Truncate to save memory/compute (e.g. 10s)
-        max_len_sec = 10 
-        if audio.shape[1] > int(max_len_sec * sr):
-             audio = audio[:, : int(max_len_sec * sr)]
-             if audio_len is not None:
-                 audio_len = torch.clamp(audio_len, max=int(max_len_sec * sr))
-
-        # Use exact same pattern as original NeMo code
-        with torch.autocast(device_type="cuda", dtype=torch.float32):
-            with torch.no_grad():
-                # Resample to Speaker Encoder's rate (usually 16k)
-                model_sr = self.speaker_encoder._cfg.train_ds.get('sample_rate', 16000)
-                if sr != model_sr:
-                    audio = resample(audio, sr, model_sr)
-                    if audio_len is not None:
-                        audio_len = audio_len * (model_sr / sr)
-                
-                if audio_len is None:
-                    audio_len = torch.full((audio.shape[0],), audio.shape[1], device=audio.device, dtype=torch.long)
-                
-                # EncDecSpeakerLabelModel expects input_signal, input_signal_length
-                _, embs = self.speaker_encoder(input_signal=audio.float(), input_signal_length=audio_len.long())
-        
-        # Convert to model dtype (same as original: g.to(self.inference_speaker_embedding.dtype))
-        return embs.to(self.inference_speaker_embedding.dtype) # (B, D_spk)
-
-    def forward(self, llm_hidden, text_embeds, speaker_emb=None, semantic_labels=None, loss_mask_semantic=None,
-                inference_mode=False, temperature=0.9, topk=5):
-        """
-        Args:
-            llm_hidden: (B, T, D_llm)
-            text_embeds: (B, T, D_llm)
-            speaker_emb: (B, D_spk) or None
-            semantic_labels: (B, T, nq) - Ground truth codes for teacher forcing (training only)
-            loss_mask_semantic: (B, T)
-            inference_mode: bool - If True, run inference (generate tokens); otherwise training
-            temperature: float - Sampling temperature (inference only)
-            topk: int - Top-k sampling (inference only)
-        Returns:
-            Training: dict with 'c0_logits', 'c_rest_logits'
-            Inference: Tensor (B, T, nq) - Generated semantic tokens
-        """
-        if inference_mode:
-            return self._inference_forward(llm_hidden, text_embeds, speaker_emb, temperature, topk)
-        
-        # Training forward
-        B, T, _ = llm_hidden.shape
-        device = llm_hidden.device
-        
-        # Get model dtype (may be bfloat16 due to FSDP mixed precision)
-        model_dtype = self.tts_input_projection.weight.dtype
-
-        # 1. Expand Speaker Embedding
-        if speaker_emb is not None:
-            # (B, D_spk) -> (B, T, D_spk)
-            speaker_emb_expanded = speaker_emb.unsqueeze(1).expand(-1, T, -1).to(model_dtype)
-        else:
-             # Dummy
-             spk_dim = self.cfg.get("speaker_embedding_dim", 192)
-             speaker_emb_expanded = torch.zeros((B, T, spk_dim), device=device, dtype=model_dtype)
-
-        # 2. Backbone Input - ensure all inputs have same dtype
-        combined_input = torch.cat([
-            llm_hidden.to(model_dtype), 
-            text_embeds.to(model_dtype), 
-            speaker_emb_expanded
-        ], dim=-1)
-        tts_backbone_input = self.tts_input_projection(combined_input) # (B, T, D_bb)
-
-        # 3. Backbone Forward
-        # Create mask and input_pos (following FireRedTTS2 original code)
-        backbone_mask = _create_causal_mask(T, device)
-        backbone_mask = backbone_mask.unsqueeze(0).expand(B, -1, -1)  # (B, T, T)
-        input_pos = torch.arange(0, T, device=device).unsqueeze(0).expand(B, T).long()
-        
-        tts_backbone_out = self.tts_backbone(tts_backbone_input, input_pos=input_pos, mask=backbone_mask) # (B, T, D_bb)
-        # torchtune's unembed calls .float() which may cause issues
-        # Convert back to model_dtype and ensure it's a regular tensor (not inference tensor)
-        tts_backbone_out = tts_backbone_out.to(model_dtype)
-        if tts_backbone_out.is_inference():
-            tts_backbone_out = tts_backbone_out.clone()
-
-        # 4. Predict C0
-        c0_logits = self.codebook0_head(tts_backbone_out) # (B, T, V)
-
-        ans = {"c0_logits": c0_logits}
-
-        # 5. Decoder Forward (Training Only - needs semantic_labels)
-        if semantic_labels is not None:
-            # Flatten backbone output to process each frame as a sequence for Decoder
-            # (B*T, D_bb)
-            backbone_out_flat = tts_backbone_out.reshape(-1, self.tts_backbone_dim)
-            
-            # Project to Decoder Cond
-            # (B*T, D_dec)
-            decoder_conditioning = self.backbone_to_decoder_projection(backbone_out_flat)
-            
-            # Prepare Decoder Inputs
-            # Input: [Conditioning, C0, C1, ..., CN-2]
-            # Target: [C1, C2, ..., CN-1]
-            
-            # semantic_labels: (B, T, nq) -> (B*T, nq)
-            flat_labels = semantic_labels.reshape(-1, self._num_codebooks)
-            
-            # Get Embeddings for C0...CN-2
-            # Offset: token_id + codebook_idx * vocab_size
-            # We need inputs for positions 0 to N-2
-            # Codebooks indices: 0 to N-2
-            
-            # Construct input tokens:
-            # We want embeddings for C0(idx0), C1(idx1)...
-            # FireRed logic: embed(token + layer_id * vocab)
-            
-            # Input tokens: flat_labels[:, :-1] (C0..CN-2)
-            input_codes = flat_labels[:, :-1] # (N_samples, nq-1)
-            
-            # Add offsets
-            offsets = torch.arange(self._num_codebooks - 1, device=device) * self._codebook_size
-            input_indices = input_codes + offsets
-            
-            # Embed
-            # (N_samples, nq-1, D_dec)
-            code_embeds = self.decoder_audio_embeddings(input_indices)
-            
-            # Concat [Conditioning, Code_Embeds]
-            # conditioning: (N_samples, D_dec) -> (N_samples, 1, D_dec)
-            decoder_embeds = torch.cat([decoder_conditioning.unsqueeze(1), code_embeds], dim=1)
-            
-            # Decoder Forward
-            # Mask and Pos (following FireRedTTS2 original code)
-            N_samples = decoder_embeds.size(0)
-            seq_len = decoder_embeds.size(1) # nq
-            decoder_mask = _create_causal_mask(seq_len, device).unsqueeze(0).expand(N_samples, -1, -1)
-            c_pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(N_samples, -1).long()
-            
-            decoder_h = self.tts_decoder(decoder_embeds, input_pos=c_pos, mask=decoder_mask) # (N, nq, D)
-            decoder_h = decoder_h.to(model_dtype)  # Ensure dtype consistency
-            if decoder_h.is_inference():
-                decoder_h = decoder_h.clone()
-            
-            # Predict C1..CN-1
-            # We need outputs corresponding to inputs [Cond, C0, ... CN-2]
-            # Output of Cond -> Predicts C0? No, Backbone predicts C0.
-            # Wait, FireRed Logic:
-            # Backbone -> C0
-            # Decoder(Cond) -> ?
-            # Let's check FireRed code/logic again.
-            # Usually: 
-            #   Backbone -> C0
-            #   Decoder Input: [BackboneProj, C0_emb, C1_emb...]
-            #   Decoder Output 0 (from BackboneProj) -> Predict C1
-            #   Decoder Output 1 (from C0_emb) -> Predict C2
-            #   ...
-            
-            # So:
-            # decoder_h[:, 0] -> Head0 -> C1
-            # decoder_h[:, 1] -> Head1 -> C2
-            # ...
-            # decoder_h[:, -1] (corresponding to CN-2 input) -> Head(N-2) -> CN-1
-            
-            # We need all outputs from 0 to N-2.
-            # decoder_h has shape (N, nq, D). (Input len was 1 + (nq-1) = nq)
-            # 0..nq-1
-            
-            # Heads: audio_head shape (num_codebooks-1, D, V) -> (15, D, V)
-            # We need to apply Head[i] to Output[i].
-            
-            # Einsum: 
-            # decoder_h: (Batch, Seq, Dim)
-            # audio_head: (Seq, Dim, Vocab)
-            # Result: (Batch, Seq, Vocab)
-            
-            # Check dimensions:
-            # decoder_h length is nq (16).
-            # We predict C1...CN-1 (15 codes).
-            # The last input was C(N-2). Its output predicts C(N-1).
-            # The first input was Cond. Its output predicts C1.
-            # So we use indices 0 to N-2.
-            # Wait, 0 to 14 is 15 elements.
-            # decoder_h[:, :-1] ?
-            
-            # Let's verify input construction:
-            # decoder_embeds = [Cond, C0, C1, ... C14] -> Length 16.
-            # Outputs: [H_Cond, H_C0, ... H_C14]
-            # H_Cond -> predicts C1.
-            # H_C14 -> predicts C15 (CN-1).
-            
-            # So we use ALL outputs?
-            # Yes, length is 16. But we only have 15 heads (C1 to C15).
-            # Wait, C0 is predicted by Backbone.
-            # C1..C15 are predicted by Decoder. That is 15 codes.
-            # If input is length 16, we get 16 outputs.
-            # H_Cond -> C1.
-            # ...
-            # H_C14 -> C15.
-            # What about H_C14? The input was C14. Output predicts C15.
-            # So we use decoder_h[:, :15] ?
-            # Or is audio_head size 16?
-            # self._num_codebooks = 16.
-            # audio_head size: num - 1 = 15.
-            
-            # So we take decoder_h[:, :-1] (0..14) -> 15 steps.
-            # Matches audio_head (15).
-            
-            decoder_h_useful = decoder_h[:, 1:, :] # (N, nq-1, D)
-            
-            # Einsum
-            c_rest_logits = torch.einsum("bnd,ndv->bnv", decoder_h_useful, self.audio_head)
-            
-            # Reshape back to (B, T, nq-1, V)
-            c_rest_logits = c_rest_logits.reshape(B, T, self._num_codebooks - 1, self._codebook_size)
-            ans["c_rest_logits"] = c_rest_logits
-
-        return ans
-
-    def _inference_forward(self, llm_hidden, text_embeds, speaker_emb=None, temperature=0.9, topk=5):
-        """
-        Inference Logic: Parallel Backbone + Parallel Decoder (via Batching Time)
-        Called from forward() when inference_mode=True, so FSDP unshard is triggered.
-        """
-        B, T, _ = llm_hidden.shape
-        device = llm_hidden.device
-        
-        # Get model dtype
-        model_dtype = self.tts_input_projection.weight.dtype
-        
-        # Expand speaker embedding if needed
-        if speaker_emb is not None:
-             if speaker_emb.dim() == 2:
-                 # speaker_emb: (B_spk, D) -> (B, T, D)
-                 # Handle case where B_spk=1 but B>1 (broadcast single reference to batch)
-                 if speaker_emb.shape[0] == 1 and B > 1:
-                     speaker_emb = speaker_emb.expand(B, -1)  # (B, D)
-                 speaker_emb = speaker_emb.unsqueeze(1).expand(-1, T, -1).to(model_dtype)
-        else:
-             spk_dim = self.cfg.get("speaker_embedding_dim", 192)
-             speaker_emb = torch.zeros((B, T, spk_dim), device=device, dtype=model_dtype)
-
-        # ========== Step 1: Run Backbone (Parallel for all T) ==========
-        # Combine inputs: LLM Hidden + Text Embed + Speaker Embed
-        combined_input = torch.cat([
-            llm_hidden.to(model_dtype), 
-            text_embeds.to(model_dtype), 
-            speaker_emb
-        ], dim=-1) # (B, T, D_in)
-        
-        # Project
-        tts_backbone_input = self.tts_input_projection(combined_input) # (B, T, D_bb)
-        
-        # Run Backbone (Full Sequence)
-        # Create mask and input_pos (same as training forward)
-        backbone_mask = _create_causal_mask(T, device)
-        backbone_mask = backbone_mask.unsqueeze(0).expand(B, -1, -1)  # (B, T, T)
-        input_pos = torch.arange(0, T, device=device).unsqueeze(0).expand(B, T).long()
-        
-        tts_backbone_out = self.tts_backbone(tts_backbone_input, input_pos=input_pos, mask=backbone_mask) # (B, T, D_bb)
-        tts_backbone_out = tts_backbone_out.to(model_dtype)  # Ensure dtype consistency
-        
-        # Predict C0 (Full Sequence)
-        c0_logits = self.codebook0_head(tts_backbone_out) # (B, T, V)
-        c0_tokens = sample_topk(c0_logits, topk, temperature).squeeze(-1) # (B, T)
-        
-        # ========== Step 2: Run Decoder (Parallel over T, AR over Codebooks) ==========
-        # Flatten time into batch: effective_batch_size = B * T
-        # Because each frame is independent for Decoder (conditioned on Backbone Out)
-        
-        flat_c0 = c0_tokens.reshape(-1) # (B*T)
-        flat_backbone_out = tts_backbone_out.reshape(-1, self.tts_backbone_dim) # (B*T, D_bb)
-        
-        # Conditioning
-        decoder_conditioning = self.backbone_to_decoder_projection(flat_backbone_out).unsqueeze(1) # (B*T, 1, D_dec)
-        
-        # Setup Cache for B*T (use device context to ensure caches are on correct device)
-        effective_bs = B * T
-        # Delete existing caches to allow re-setup with new batch size
-        # torchtune's setup_caches skips if caches_are_setup() returns True
-        for layer in self.tts_decoder.layers:
-            if hasattr(layer, 'attn') and hasattr(layer.attn, 'kv_cache'):
-                layer.attn.kv_cache = None
-        with torch.device(device):
-            self.tts_decoder.setup_caches(batch_size=effective_bs, dtype=model_dtype, decoder_max_seq_len=self._num_codebooks)
-        
-        # Initialize result (B*T, nq)
-        gen_semantic_flat = torch.zeros(effective_bs, self._num_codebooks, dtype=torch.long, device=device)
-        gen_semantic_flat[:, 0] = flat_c0
-        
-        # Step 0 input: [Cond, Emb(C0)] - same as training (concat, not add)
-        c0_emb = self.decoder_audio_embeddings(flat_c0 + 0 * self._codebook_size).unsqueeze(1) # (B*T, 1, D_dec)
-        curr_decoder_input = torch.cat([decoder_conditioning, c0_emb], dim=1)  # (B*T, 2, D_dec)
-        
-        curr_pos = torch.arange(0, 2, device=device).unsqueeze(0).expand(effective_bs, -1).long()  # (B*T, 2)
-        
-        # Decoder Step 0 -> Predict C1 (from position 1, which attends to [Cond, C0])
-        dec_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
-        out_h = self.tts_decoder(curr_decoder_input, input_pos=curr_pos, mask=dec_mask)
-        out_h = out_h.to(model_dtype)  # Ensure dtype consistency
-        
-        logits = torch.matmul(out_h[:, -1], self.audio_head[0])
-        c_next = sample_topk(logits.unsqueeze(1), topk, temperature).squeeze(1).squeeze(-1) # (B*T)
-        gen_semantic_flat[:, 1] = c_next
-        
-        # Loop over remaining codebooks
-        # KV cache now has positions [0, 1] -> [Cond, C0]
-        # Next position is 2
-        curr_pos = torch.full((effective_bs, 1), 2, device=device, dtype=torch.long)
-        prev = c_next
-        for i in range(1, self._num_codebooks - 1):
-             emb_idx = prev + i * self._codebook_size
-             prev_emb = self.decoder_audio_embeddings(emb_idx).unsqueeze(1)  # (B*T, 1, D_dec)
-             
-             dec_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
-             out_h = self.tts_decoder(prev_emb, input_pos=curr_pos, mask=dec_mask)
-             out_h = out_h.to(model_dtype)  # Ensure dtype consistency
-             
-             logits = torch.matmul(out_h[:, -1], self.audio_head[i])
-             c_next = sample_topk(logits.unsqueeze(1), topk, temperature).squeeze(1).squeeze(-1)
-             gen_semantic_flat[:, i+1] = c_next
-             
-             curr_pos = curr_pos + 1
-             prev = c_next
-             
-        # Reshape back to (B, T, nq)
-        gen_semantic = gen_semantic_flat.reshape(B, T, self._num_codebooks)
-        
-        # Clean up kv_cache after inference to avoid interference with training forward
-        for layer in self.tts_decoder.layers:
-            if hasattr(layer, 'attn') and hasattr(layer.attn, 'kv_cache'):
-                layer.attn.kv_cache = None
-        
-        return gen_semantic
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
@@ -679,25 +169,46 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
 
-        # [新增] 初始化 FireRedTTS2 Codec
-        codec_conf = self.cfg.get("codec_config_path", "FireRedTTS2/config_codec.json")
-        codec_ckpt = self.cfg.get("codec_checkpoint_path", "FireRedTTS2/codec.pt")
-        
-        if not os.path.exists(codec_conf) or not os.path.exists(codec_ckpt):
-            logging.warning(f"Codec files not found at default paths.\nConf: {codec_conf}\nCkpt: {codec_ckpt}\nPlease set `codec_config_path` and `codec_checkpoint_path` in model config.")
-        
-        with fp32_precision():
-            self.red_codec = RedCodecInfer.from_pretrained(codec_conf, codec_ckpt).eval()
-        for p in self.red_codec.parameters():
-            p.requires_grad = False
-        
-        # FireRedSpeechGenerator
-        self.speech_generation = FireRedSpeechGenerator(self.cfg, self.tokenizer)
-        
-        # Shortcuts for metrics (semantic_acc needs these)
-        self._codebook_size = self.speech_generation._codebook_size
-        self._num_codebooks = self.speech_generation._num_codebooks
+        # Setup semantic token generation components
+        self._codebook_size = 16384
+        self._num_codebooks = 1
 
+        # WhisperVQ tokenizer for semantic token extraction (target only)
+        self.whispervq = WhisperVQEncoder.from_pretrained(
+            "THUDM/glm-4-voice-tokenizer",
+            cache_dir='/mnt/donghang-jfs/pretrained_models',
+        ).float().eval()
+
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+            "THUDM/glm-4-voice-tokenizer",
+            cache_dir='/mnt/donghang-jfs/pretrained_models',
+        )
+
+        # Semantic token predictor for predicting output semantic tokens
+        # Supports two modes: MLP (lightweight) or Transformer (with temporal modeling)
+        # Design: Sequential prediction (text first, then semantic)
+        self._use_transformer_semantic = self.cfg.get("use_transformer_semantic_predictor", False)
+        
+        if self._use_transformer_semantic:
+            self.semantic_predictor = TransformerSemanticPredictor(
+                llm_hidden_dim=self.llm.config.hidden_size,
+                semantic_vocab_size=self._codebook_size,  # 16384 - WhisperVQ semantic vocabulary
+                d_model=self.cfg.get("semantic_predictor_d_model", 1024),
+                n_heads=self.cfg.get("semantic_predictor_n_heads", 8),
+                n_layers=self.cfg.get("semantic_predictor_n_layers", 4),
+                n_cond_layers=self.cfg.get("semantic_predictor_n_cond_layers", 2),
+                dim_feedforward=self.cfg.get("semantic_predictor_dim_feedforward", 2048),
+                dropout=self.cfg.get("semantic_predictor_dropout", 0.1),
+                max_seq_len=self.cfg.get("semantic_predictor_max_seq_len", 4096),
+            )
+        else:
+            self.semantic_predictor = SemanticTokenPredictor(
+                llm_hidden_dim=self.llm.config.hidden_size,
+                semantic_vocab_size=self._codebook_size,  # 16384 - WhisperVQ semantic vocabulary
+                hidden_dim=self.cfg.get("semantic_predictor_hidden_dim", 512),
+                dropout=self.cfg.get("semantic_predictor_dropout", 0.1),
+            )
+        
         # Add binary classification head for COT/response classification (output dim=1 for sigmoid)
         # self.cot_classification_head = torch.nn.Linear(self.llm.config.hidden_size, 1)
         self.cot_classification_head = torch.nn.Sequential(
@@ -1011,15 +522,18 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             loss_mask_semantic=None,
             audio_embed=None,    # For training: ELBO audio embeddings
             text_embed=None,     # For training: ELBO text embeddings
-            full_loss_mask=None,
-            speaker_emb=None,    # Speaker Embedding
-            target_audio=None,   # Deprecated, kept for compat
-            target_audio_lens=None, # Deprecated
+            full_loss_mask=None
     ) -> dict[str, Tensor]:
         """
         Sequential text and semantic prediction:
             - Step 1: Text prediction via LLM + lm_head
-            - Step 2: Semantic prediction via FireRedSpeechGenerator
+            - Step 2: Semantic prediction via semantic_predictor using [llm_hidden, text_embed]
+        
+        Shape annotations:
+            input_embeds: (B, T, D) - Input embeddings to LLM
+            text_labels: (B, T) - Ground truth text tokens (training only)
+            semantic_labels: (B, T) - Ground truth semantic tokens (training only)
+            loss_mask: (B, T) - Valid positions mask
         """
         # ========== Step 1: LLM Forward Pass ==========
         # Handle different cache parameter names for different models
@@ -1071,6 +585,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 predicted_text_tokens = text_logits.argmax(dim=-1)  # (B, T)
                 text_embeds = self.embed_tokens(predicted_text_tokens)  # (B, T, D)
 
+            # Call semantic predictor
+            # Inputs:
+            #   llm_hidden: (B, T, D)
+            #   text_embeds: (B, T, D)
+            # Outputs:
+            #   semantic_logits: (B, T, semantic_vocab_size=16384)
+            semantic_result = self.semantic_predictor(
+                llm_hidden=llm_hidden,
+                text_embeds=text_embeds,
+                semantic_labels=semantic_labels,  # (B, T) or None
+                loss_mask=loss_mask_semantic,  # (B, T) or None
+            )
+            
+            ans["semantic_logits"] = semantic_result["semantic_logits"]  # (B, T, 16384)
+            if "semantic_loss" in semantic_result:
+                ans["semantic_loss"] = semantic_result["semantic_loss"]  # scalar
             ans["cot_classification_logits"] = self.cot_classification_head(out['last_hidden_state'])
         else:
              # Training mode: use ELBO logic with audio_embed + text_embed
@@ -1154,29 +684,33 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             # ========== Step 2: Semantic Token Prediction ==========
             # Prepare text embeddings
-            # Always use predicted text tokens from LLM logits (NOT text_labels) for TTS conditioning
-            # This ensures TTS is conditioned on what LLM actually "thinks/generates", 
-            # consistent with the principle of using generated text tokens for TTS.
-            
-            # text_logits: (B, T, text_vocab_size) -> argmax -> (B, T)
-            predicted_text_tokens = text_logits.argmax(dim=-1)  # (B, T)
-            text_embeds = self.embed_tokens(predicted_text_tokens)  # (B, T, D)
+            # Training: use ground truth text tokens (teacher forcing)
+            # Inference: handled separately in generate method
+            if text_labels is not None:
+                # text_labels: (B, T)
+                text_embeds = self.embed_tokens(text_labels)  # (B, T, D)
+            else:
+                # Fallback: use predicted text tokens
+                # text_logits: (B, T, text_vocab_size) -> argmax -> (B, T)
+                predicted_text_tokens = text_logits.argmax(dim=-1)  # (B, T)
+                text_embeds = self.embed_tokens(predicted_text_tokens)  # (B, T, D)
 
-            # ========== Step 2: Semantic (Audio) Token Prediction ==========
-        
-            # Use FireRedSpeechGenerator
-            speech_gen_out = self.speech_generation(
+            # Call semantic predictor
+            # Inputs:
+            #   llm_hidden: (B, T, D)
+            #   text_embeds: (B, T, D)
+            # Outputs:
+            #   semantic_logits: (B, T, semantic_vocab_size=16384)
+            semantic_result = self.semantic_predictor(
                 llm_hidden=llm_hidden,
                 text_embeds=text_embeds,
-                speaker_emb=speaker_emb,
-                semantic_labels=semantic_labels,
-                loss_mask_semantic=loss_mask_semantic
+                semantic_labels=semantic_labels,  # (B, T) or None
+                loss_mask=loss_mask_semantic,  # (B, T) or None
             )
             
-            ans["semantic_logits"] = speech_gen_out["c0_logits"]
-            if "c_rest_logits" in speech_gen_out:
-                ans["c_rest_logits"] = speech_gen_out["c_rest_logits"]
-
+            ans["semantic_logits"] = semantic_result["semantic_logits"]  # (B, T, 16384)
+            if "semantic_loss" in semantic_result:
+                ans["semantic_loss"] = semantic_result["semantic_loss"]  # scalar
 
             # Compute MSE loss inside forward to avoid keeping Z in memory
             mse_loss = 0.0
@@ -1266,41 +800,29 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         target_tokens = batch["target_tokens"]  # (B, T_text)
         loss_mask = batch.get("loss_mask", None)
 
-        # print('target_tokens', target_tokens.shape)
-        # print('loss_mask', loss_mask.shape)
+        print('target_tokens', target_tokens.shape)
+        print('loss_mask', loss_mask.shape)
 
-        with torch.no_grad(), fp32_precision():
-            # 确保 audio 在正确 device
-            target_audio = batch["target_audio"].to(self.device).float()
-            target_audio_lens = batch["target_audio_lens"].to(self.device)
-            
-            # 编码 (需要 fp32 精度)
-            # Note: red_codec.encode uses @torch.inference_mode(), so output is inference tensor
-            tokens, token_lens = self.red_codec.encode(
-                target_audio, 
-                target_audio_lens,
-                batch_size=target_audio.shape[0]
-            )
-            # tokens: (B, nq, L) -> permute to (B, L, nq)
-            # Clone to convert from inference tensor to regular tensor
-            target_semantic = tokens.permute(0, 2, 1).long().clone() # (B, T_tgt, nq)
+        # ========== Extract Target Semantic Tokens (agent speech) ==========
 
-        # # ========== Length Alignment ==========
-        # if self.global_rank == 0:
-        #     print('source_encoded.shape', source_encoded.shape)
-        #     print('target_semantic.shape', target_semantic.shape)
-        #     print('target_tokens.shape', target_tokens.shape)
+        target_semantic = extract_speech_token(
+            self.whispervq,
+            self.feature_extractor,
+            [(batch["target_audio"][i].unsqueeze(0), self.target_sample_rate) for i in range(batch["target_audio"].shape[0])],
+        )
+        target_semantic = torch.tensor(target_semantic, dtype=torch.long, device=self.device)  # (B, T_tgt_audio)
 
-        # [修改] Length Alignment
+        # ========== Length Alignment ==========
+      
         min_len = min(
-            source_encoded.shape[1],
-            target_semantic.shape[1], # T_tgt
-            target_tokens.shape[1]
+            source_encoded.shape[1],      # T_perception
+            target_semantic.shape[1],     # T_tgt_audio
+            target_tokens.shape[1]        # T_text
         )
         
        
         source_encoded = source_encoded[:, :min_len]          # (B, min_len, D)
-        target_semantic = target_semantic[:, :min_len, :]        # (B, min_len, nq)
+        target_semantic = target_semantic[:, :min_len]        # (B, min_len)
         target_tokens = target_tokens[:, :min_len]            # (B, min_len)
         loss_mask = loss_mask[:, :min_len]                    # (B, min_len)
         source_encoded_lens = torch.clamp_(source_encoded_lens, max=min_len)  # (B,)
@@ -1318,9 +840,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Semantic channel: text[t] -> predict semantic[t]
         # Key: semantic_labels and text_labels are aligned (predicting same timestep)
         # In forward, we use text_labels as source for text_embeds
-         # [修改] Semantic Labels
-        # semantic_labels 包含所有 codebook: (B, T-1, nq)
-        semantic_labels = target_semantic[:, 1:, :] 
+        semantic_labels = target_semantic[:, 1:]  # (B, T-1) - semantic prediction target
+
         # ========== Prepare Input Embeddings ==========
         # Combine text_embeds and audio perception embeds
         text_embeds = self.embed_tokens(text_inputs)  # (B, T-1, D)
@@ -1349,7 +870,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "input_lens": source_encoded_lens - 1,  # (B,) - Subtract 1 due to shift operation
             "output_lens": source_encoded_lens - 1,  # (B,)
             "text_labels": text_labels,             # (B, T-1)
-            "semantic_labels": semantic_labels, # (B, T-1, nq)
+            "semantic_labels": semantic_labels,     # (B, T-1)
             "loss_mask_semantic": loss_mask_semantic, # (B, T-1)
             "loss_mask": loss_mask,                 # (B, T-1)
             "cot_label": loss_mask.int(),
@@ -1359,21 +880,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         }
 
         return result
-
-    def on_train_epoch_start(self) -> None:
-        """Reload speaker encoder to bypass FSDP DTensor issues and ensure fp32 precision"""
-        # Ensure red_codec stays in fp32
-        if hasattr(self, 'red_codec'):
-            self.red_codec.float()
-            self.red_codec.eval()
-        
-        # Reload speaker encoder to bypass FSDP DTensor issues
-        if hasattr(self, 'speech_generation') and hasattr(self.speech_generation, 'speaker_encoder'):
-            self.speech_generation.setup_speaker_encoder()
-
-    def on_validation_epoch_start(self) -> None:
-        """Same setup as training epoch start"""
-        self.on_train_epoch_start()
 
     def training_step(self, batch: dict, batch_idx: int):
         """
@@ -1398,14 +904,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if batch["audio_data"] is not None:
             inputs = self.prepare_inputs(batch["audio_data"])
 
-            # Get Speaker Embedding (Training Phase)
-            speaker_emb = None
-            if hasattr(self, 'speech_generation') and self.speech_generation.speaker_encoder is not None:
-                 if "target_first_turn_audio" in batch["audio_data"]:
-                     target_first_audio = batch["audio_data"]["target_first_turn_audio"]
-                     target_first_lens = batch["audio_data"]["target_first_turn_audio_lens"]
-                     speaker_emb = self.speech_generation.get_speaker_embedding(target_first_audio, target_first_lens, self.target_sample_rate)
-
             # ========== Forward Pass ==========
             forward_outputs = self(
                 # inputs["input_embeds"],              # (B, T-1, D)
@@ -1415,7 +913,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 text_embed=inputs["text_embed"],
                 audio_embed=inputs["audio_embed"],
                 full_loss_mask=inputs["full_loss_mask"],
-                speaker_emb=speaker_emb,
             )
 
             num_frames = inputs["input_lens"].sum()
@@ -1433,77 +930,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     ) * loss_mask.flatten(0, 1)).sum(-1) / num_frames
                 )
 
-                # [修改] Semantic Loss Calculation
-                # 1. C0 Loss (Original Semantic Loss)
-                c0_logits = forward_outputs["semantic_logits"] # (B, T, V)
-                semantic_labels = inputs["semantic_labels"] # (B, T, nq)
-                c0_labels = semantic_labels[:, :, 0] # (B, T)
+                # ========== Calculate Semantic Loss & Accuracy ==========
+                semantic_loss = forward_outputs.get("semantic_loss", torch.tensor(0.0, device=text_logits.device))
                 
-                loss_mask_semantic = inputs["loss_mask_semantic"]
+                # Calculate semantic accuracy
+                semantic_logits = forward_outputs["semantic_logits"]  # (B, T-1, 16384)
+                semantic_labels = inputs["semantic_labels"]  # (B, T-1)
+                loss_mask_semantic = inputs["loss_mask_semantic"]  # (B, T-1)
                 
-                c0_loss = torch.nn.functional.cross_entropy(
-                    c0_logits.flatten(0, 1),
-                    c0_labels.flatten(0, 1),
-                    reduction="none"
-                )
                 if loss_mask_semantic is not None:
-                    c0_loss = (c0_loss * loss_mask_semantic.flatten()).sum() / num_frames
+                    semantic_pred = semantic_logits[loss_mask_semantic].argmax(-1)  # (N,)
+                    semantic_target = semantic_labels[loss_mask_semantic]  # (N,)
+                    semantic_acc = (semantic_pred == semantic_target).float().mean()
                 else:
-                    c0_loss = c0_loss.mean()
+                    semantic_pred = semantic_logits.argmax(dim=-1)  # (B, T-1)
+                    semantic_acc = (semantic_pred == semantic_labels).float().mean()
 
-                # 2. C1 ~ CN Loss (Decoder Loss)
-                c_rest_loss = 0.0
-                if "c_rest_logits" in forward_outputs:
-                    c_rest_logits = forward_outputs["c_rest_logits"] # (B, T, nq-1, V)
-                    c_rest_labels = semantic_labels[:, :, 1:] # (B, T, nq-1)
-                    
-                    # Flatten for CE
-                    # (B*T*(nq-1), V)
-                    c_rest_loss_raw = torch.nn.functional.cross_entropy(
-                        c_rest_logits.reshape(-1, self._codebook_size),
-                        c_rest_labels.reshape(-1),
-                        reduction="none"
-                    )
-                    
-                    # Apply mask (expand mask to nq-1 dimension)
-                    if loss_mask_semantic is not None:
-                        # (B, T) -> (B, T, nq-1) -> flatten
-                        mask_expanded = loss_mask_semantic.unsqueeze(-1).expand(-1, -1, self._num_codebooks - 1).reshape(-1)
-                        c_rest_loss = (c_rest_loss_raw * mask_expanded).sum() / (num_frames * (self._num_codebooks - 1))
-                    else:
-                        c_rest_loss = c_rest_loss_raw.mean()
-
-                # Total Semantic Loss
-                semantic_loss = c0_loss + c_rest_loss
-                
                  # ========== Calculate Text Accuracy ==========
                 with torch.no_grad():
-                    # Calculate semantic accuracy (All Codebooks)
-                    # 1. C0 Accuracy
-                    c0_pred = c0_logits.argmax(dim=-1)
-                    if loss_mask_semantic is not None:
-                        acc_c0 = (c0_pred == c0_labels).float()[loss_mask_semantic].mean()
-                    else:
-                        acc_c0 = (c0_pred == c0_labels).float().mean()
-
-                    # 2. C1-CN Accuracy
-                    if "c_rest_logits" in forward_outputs:
-                        c_rest_logits = forward_outputs["c_rest_logits"] # (B, T, nq-1, V)
-                        c_rest_labels = semantic_labels[:, :, 1:] # (B, T, nq-1)
-                        c_rest_pred = c_rest_logits.argmax(dim=-1) # (B, T, nq-1)
-                        
-                        if loss_mask_semantic is not None:
-                            mask_expanded = loss_mask_semantic.unsqueeze(-1).expand(-1, -1, self._num_codebooks - 1)
-                            acc_rest = (c_rest_pred == c_rest_labels).float()[mask_expanded].mean()
-                        else:
-                            acc_rest = (c_rest_pred == c_rest_labels).float().mean()
-                        
-                        # Weighted average
-                        num_rest = self._num_codebooks - 1
-                        semantic_acc = (acc_c0 + acc_rest * num_rest) / self._num_codebooks
-                    else:
-                        semantic_acc = acc_c0
-
                     # print('text_labels', inputs["text_labels"].shape)
                     # print('loss_mask', loss_mask.shape)
                     predicted_tokens = torch.argmax(text_logits, dim=-1)# (B, T-1)
@@ -1599,20 +1043,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return res
 
     def on_train_epoch_start(self) -> None:
-        # Ensure red_codec stays in fp32 (PTL may auto-downcast to bf16)
-        if hasattr(self, "red_codec"):
-            self.red_codec = self.red_codec.float().eval()
-        # Reload speaker_encoder to bypass FSDP DTensor issues (creates new instance not wrapped by FSDP)
-        if hasattr(self, "speech_generation") and hasattr(self.speech_generation, "setup_speaker_encoder"):
-            self.speech_generation.setup_speaker_encoder()
+        pass
 
     def on_validation_epoch_start(self) -> None:
-        self.on_train_epoch_start()  # Ensure codecs stay in fp32
         # Initialize ResultsLogger (it will automatically find manifest_files in its own directory)
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
 
         self.bleu = BLEU().reset()
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
 
         # Initialize turn taking metrics
         self.turn_taking_metrics = TurnTakingMetrics(
@@ -1628,10 +1065,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for k, m in bleu.items():
             if "qa" not in k and "mmsu" not in k:
                 self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-
-        asr_bleu = self.asr_bleu.compute()
-        for k, m in asr_bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
         acc_metrics = self.results_logger.compute_and_save()
 
@@ -1698,26 +1131,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
 
             if "audio" in results:
-                # Update ASR-BLEU metric
-                # RedCodec outputs 24kHz audio, ASR needs 16kHz
-                codec_sr = 24000
-                asr_sr = 16000
-                with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                    asr_hyps = self.asr_bleu.update(
-                        name=name,
-                        refs=dataset_batch["target_texts"],
-                        pred_audio=resample(results["audio"], codec_sr, asr_sr),
-                        pred_audio_lens=(results["audio_len"] / codec_sr * asr_sr).to(torch.long),
-                    )
 
                 self.results_logger.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
                     hyps=results["text"],
-                    asr_hyps=asr_hyps,
+                    asr_hyps=None,
                     samples_id=dataset_batch['sample_id'],
                     pred_audio=results["audio"],
-                    pred_audio_sr=codec_sr,
+                    pred_audio_sr=22050,
                     user_audio=dataset_batch["source_audio"],
                     user_audio_sr=self.source_sample_rate,
                 )
@@ -1769,8 +1191,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             decode_audio=self.cfg.prediction.decode_audio,
             input_pad_len=self.cfg.prediction.max_new_seconds * self.cfg.prediction.input_sample_rate,
             force_bos_positions=force_bos_positions,
-            speaker_reference_audio=batch.get("target_audio"),
-            speaker_reference_audio_lens=batch.get("target_audio_lens"),
         )
         prediction["sample_id"] = batch["sample_id"]
         return prediction
@@ -1782,12 +1202,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         numerator = torch.sum(pad_pred.masked_select(mask) == pad_targets.masked_select(mask))
         denominator = torch.sum(mask)
         return (numerator / denominator).detach().item() if denominator > 0 else 0.0
-
-    def get_speaker_embedding(self, audio, audio_len, sr):
-        """Delegate to speech_generation module"""
-        if hasattr(self, 'speech_generation'):
-            return self.speech_generation.get_speaker_embedding(audio, audio_len, sr)
-        return None
 
     def load_flow_decoder(self):
         """Load flow-based audio decoder for waveform generation."""
@@ -1889,9 +1303,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_pad_len: int = 0,
             force_bos_positions=None,
             loss_mask = None,
-            text_embed = None,
-            speaker_reference_audio = None, # [新增]
-            speaker_reference_audio_lens = None, # [新增]
+            text_embed = None
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive text prediction.
@@ -1918,34 +1330,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal = input_signal.to(device)[:1, :]
             input_signal = resample(input_signal, sr, self.source_sample_rate)
             input_signal_lens = torch.tensor([input_signal.size(-1)]).to(device)
-
-        # Extract Speaker Embedding for Inference
-        speaker_emb = None
-        if hasattr(self, 'speech_generation') and self.speech_generation.speaker_encoder is not None:
-            # 1. Config Priority
-            ref_path = self.cfg.get('inference_speaker_reference', None)
-            if ref_path is not None:
-                # Load audio
-                ref_audio, ref_sr = librosa.load(ref_path, sr=None) # Load native
-                ref_audio = torch.tensor(ref_audio, device=self.device).unsqueeze(0) # (1, T)
-                ref_lens = torch.tensor([ref_audio.shape[1]], device=self.device)
-                speaker_emb = self.speech_generation.get_speaker_embedding(ref_audio, ref_lens, ref_sr)
-            
-            # 2. Argument Priority
-            elif speaker_reference_audio is not None:
-                # Use provided reference (assume target_sample_rate if passed from batch, or check?)
-                # If passed from predict_step using batch['target_audio'], it is target_sample_rate.
-                ref_audio = speaker_reference_audio
-                ref_lens = speaker_reference_audio_lens
-                if ref_lens is None:
-                    ref_lens = torch.full((ref_audio.shape[0],), ref_audio.shape[1], device=ref_audio.device, dtype=torch.long)
-                
-                speaker_emb = self.speech_generation.get_speaker_embedding(ref_audio, ref_lens, self.target_sample_rate)
-                
-            # 3. Fallback
-            elif input_signal is not None:
-                # Fallback to input signal (source_sample_rate)
-                speaker_emb = self.speech_generation.get_speaker_embedding(input_signal, input_signal_lens, self.source_sample_rate)
 
         if force_bos_positions is not None:
             assert input_signal.shape[0] == len(
@@ -2039,11 +1423,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
         gen_semantic = torch.empty(B, T, device=self.device, dtype=torch.long)
         
-        # Collect llm_hidden history for TTS
-        llm_hidden_history = torch.empty(B, T, self.llm.config.hidden_size, device=self.device, dtype=source_encoded.dtype)
+        # For TransformerSemanticPredictor: collect llm_hidden history
+        # This is needed because in cached mode, ans["llm_hidden"] only contains current step
+        if self._use_transformer_semantic:
+            llm_hidden_history = torch.empty(B, T, self.llm.config.hidden_size, device=self.device, dtype=source_encoded.dtype)
         
-        # (Caches are setup inside speech_generation.inference)
-
         # ========== Unified Autoregressive Loop (Sequential Prediction) ==========
         # Design:
         # 1. Each timestep first predicts text token via LLM
@@ -2178,20 +1562,46 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 gen_cot_classification[:, t] = (torch.sigmoid(ans["cot_classification_logits"][:, -1, 0]) > 0.5).long()
                 gen_cot_logits[:, t] = ans["cot_classification_logits"][:, -1]
 
-
-        # Generate Audio from collected hidden states and text embeddings
-        # gen_text: (B, T)
-        text_embeds = self.embed_tokens(gen_text) # (B, T, D)
-        
-        # Call speech_generation via forward() to trigger FSDP unshard mechanism
-        gen_semantic = self.speech_generation(
-             llm_hidden=llm_hidden_history,
-             text_embeds=text_embeds,
-             speaker_emb=speaker_emb,
-             inference_mode=True,
-             temperature=0.9,
-             topk=5
-        )
+            # ===== Step 3: Sequential Semantic Prediction =====
+            # Key: Use the just-predicted text[t] to predict semantic[t]
+            # Get text embedding for just-predicted text token
+            current_text_token = gen_text[:, t]  # (B,)
+            current_text_emb = self.embed_tokens(current_text_token).unsqueeze(1)  # (B, 1, D)
+            
+            # Get current llm_hidden
+            current_llm_hidden = ans["llm_hidden"][:, -1:, :]  # (B, 1, D)
+            
+            if self._use_transformer_semantic:  # False
+                # TransformerSemanticPredictor: needs full history for cross-attention
+                # Store current llm_hidden in history
+                llm_hidden_history[:, t:t+1, :] = current_llm_hidden
+                
+                # Get all generated text tokens up to and including current
+                all_text_tokens = gen_text[:, :t+1]  # (B, t+1)
+                full_text_embeds = self.embed_tokens(all_text_tokens)  # (B, t+1, D)
+                
+                # Get llm_hidden history up to current step
+                full_llm_hidden = llm_hidden_history[:, :t+1, :]  # (B, t+1, D)
+                
+                # Past semantic tokens (0 to t-1), None for first step
+                past_semantic = gen_semantic[:, :t] if t > 0 else None  # (B, t) or None
+                
+                # Generate next semantic token with transformer
+                gen_semantic[:, t] = self.semantic_predictor.generate(
+                    llm_hidden=full_llm_hidden,
+                    text_embed=full_text_embeds,
+                    temperature=self.cfg.get("semantic_temperature", 0.9),
+                    topk=self.cfg.get("semantic_topk", 20),
+                    past_semantic_tokens=past_semantic,
+                )  # (B,)
+            else:
+                # MLP SemanticTokenPredictor: frame-wise prediction
+                gen_semantic[:, t] = self.semantic_predictor.generate(
+                    llm_hidden=current_llm_hidden,  # (B, 1, D)
+                    text_embed=current_text_emb,    # (B, 1, D)
+                    temperature=self.cfg.get("semantic_temperature", 0.9),
+                    topk=self.cfg.get("semantic_topk", 20),
+                )  # (B,)
 
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
@@ -2257,9 +1667,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                                   eval_text_turn_taking=True)
         if self.global_rank == 0:
             print('gen_text_v2', gen_text_v2)
-        # gen_text_ori = tokens_to_str_ori(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens = False)
-        # if self.global_rank == 0:
-        #     print('gen_text_ori', gen_text_ori)
+        gen_text_ori = tokens_to_str_ori(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens = False)
+        if self.global_rank == 0:
+            print('gen_text_ori', gen_text_ori)
         # gen_text_v2_filtered = tokens_to_str_extract(gen_text * gen_cot_classification, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id,
         #                           user_bos_id=self.text_bos_id, 
         #                           cotstart_id=self.cotstart_id,
@@ -2278,18 +1688,35 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         }
 
         # ========== Decode Semantic Tokens to Waveform ==========
-        if decode_audio:
+        # Decode semantic tokens to waveform if requested
+        if decode_audio and self.cfg.get("pretrained_flow", None):
+            self.load_flow_decoder()
             with fp32_precision(), torch.no_grad():
-                # gen_semantic: (B, T, nq) -> (B, nq, T) for codec
-                # Safety clamp to [0, codebook_size-1] in case model generates out-of-range tokens
-                tokens = gen_semantic.clamp(0, self._codebook_size - 1).permute(0, 2, 1)
+                this_uuid = str(uuid.uuid4())
                 
-                # Decode using RedCodec
-                # decode returns: audio (B, t)
-                audio_out = self.red_codec.decode(tokens)
+                # Prepare empty prompts (no speaker conditioning for semantic tokens)
+                prompt_speech_feat = torch.zeros(B, 0, 80).to(self.device)
+                flow_prompt_speech_token = torch.zeros(B, 0, dtype=torch.int64).to(self.device)
+                spk_emb = torch.zeros(B, 192).to(self.device)
                 
-                ans["audio"] = audio_out
-                ans["audio_len"] = torch.tensor([audio_out.shape[-1]] * audio_out.shape[0], device=audio_out.device)
+                # Clean up semantic tokens: replace control tokens with 0 (if any)
+                # gen_semantic: (B, T) - already single-layer, no need to select codebook
+                flow_input_token = gen_semantic.clone()  # (B, T)
+                flow_input_token[flow_input_token > 16383] = 0  # Replace any invalid tokens
+                
+                # Decode semantic tokens to waveform
+                # Note: WhisperVQ decoder expects semantic tokens (first codebook)
+                response_speech, _ = self.audio_decoder.token2wav(
+                    flow_input_token,
+                    uuid=this_uuid,
+                    prompt_token=flow_prompt_speech_token.to(self.device),
+                    prompt_feat=prompt_speech_feat.to(self.device),
+                    embedding=spk_emb,
+                    finalize=True
+                )
+                
+                ans["audio"] = response_speech  # (B, wav_len)
+                ans["audio_len"] = torch.tensor([response_speech.shape[1]]).repeat(B).to(self.device)
 
         return ans
 
@@ -2448,13 +1875,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.llm = fully_shard(self.llm, **fsdp_config)
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
-            # self.whispervq = fully_shard(self.whispervq, **fsdp_config)
+            self.whispervq = fully_shard(self.whispervq, **fsdp_config)
             self.cot_classification_head = fully_shard(self.cot_classification_head, **fsdp_config)
             
-            # Wrap speech generation module (FireRed) - whole module only, no nested sharding
-            # Note: Unlike LLM, we don't shard internal layers separately to avoid DTensor issues
-            # during inference when calling methods other than forward()
-            self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
+            # Wrap semantic prediction module
+            self.semantic_predictor = fully_shard(self.semantic_predictor, **fsdp_config)
 
             self.non_causal_encoder = fully_shard(self.non_causal_encoder, **fsdp_config)
             if self.non_causal_proj_in is not None:
@@ -2462,6 +1887,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.non_causal_proj_out is not None:
                 self.non_causal_proj_out = fully_shard(self.non_causal_proj_out, **fsdp_config)
                 
+            # self.z_projection = fully_shard(self.z_projection, **fsdp_config)
             self.z_head = fully_shard(self.z_head, **fsdp_config)
 
     def load_state_dict(self, state_dict, strict: bool = True):
